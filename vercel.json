@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/.well-known/ai-tool/agent-check.json",
+      "destination": "/api/well-known"
+    },
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
+    }
+  ]
+}
