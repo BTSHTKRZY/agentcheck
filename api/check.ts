@@ -258,12 +258,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         `https://api.etherscan.io/api?module=account&action=balance&address=${wallet}&tag=latest&apikey=${ETHERSCAN_KEY}`
       ).then(r => r.json()),
 
-      // 3. GetBlock — Address Audit (risk + forensics)
+      // 3. GetBlock — Fraud Check (risk + forensics)
       fetch(
-        `https://hub-api.getblock.io/wallet-risk/addressAudit?address=${wallet}&network=${network}`,
-        { headers: { "x-api-key": GETBLOCK_KEY, "Content-Type": "application/json" } }
+        `https://hub-api.getblock.io/wallet-risk/fraudCheck`,
+        {
+          method: "POST",
+          headers: {
+            "x-api-key": GETBLOCK_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ address: wallet, network }),
+        }
       ).then(r => r.json()).catch(() => null),
-
+      
       // 4. Normies API — is this an ERC-8004 agent?
       fetch(`${NORMIES_API}/agents/info/${wallet}`).then(r => r.json()).catch(() => null),
 
@@ -298,8 +305,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const txList = txData?.result && Array.isArray(txData.result) ? txData.result : [];
     const ethBalance = balData?.result
-      ? (parseInt(balData.result) / 1e18).toFixed(4)
-      : "0";
+    const rawBalance = balData?.result && !isNaN(parseInt(balData.result))
+      ? parseInt(balData.result)
+      : 0;
+    const ethBalance = (rawBalance / 1e18).toFixed(4);
 
     // Wallet age
     const firstTx    = txList[0];
