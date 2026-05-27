@@ -4,12 +4,13 @@ const MANIFEST = {
   type: "https://ercs.ethereum.org/ERCS/erc-8257#tool-manifest-v1",
   name: "agent-check",
   description:
-    "The rating agency for the agent economy. AgentCheck provides comprehensive trust intelligence for any Ethereum wallet or AI agent. Returns a letter grade (AAA to D), three scores (trust, risk, agent), full rating report, safety certification status, declared permission scope, and regulatory audit trail. Data sourced from on-chain history, forensic risk screening, ERC-8004 agent registry, ERC-8257 tool usage, and community endorsements. Designed for agents that need to verify counterparties before transacting autonomously. Also provides owner monitoring, safety certification testing, agent endorsements, and outcome reporting endpoints.",
+    "description:
+    "Trust rating for any Ethereum wallet or AI agent. Returns letter grade (AAA-D), trust score, risk score, agent score, and full report. Covers on-chain history, forensic risk screening, ERC-8004 identity, endorsements, safety certifications, and permission scope. Call before any autonomous transaction.",
   endpoint: "https://agentcheck.vercel.app/api/check",
   verifiability: {
     tier: "self-attested",
     execution: "serverless",
-    dataRetention: "anonymized-aggregates",
+    dataRetention: "metadata-only",
     sourceVisibility: "open-source",
     sourceUrl: "https://github.com/BTSHTKRZY/agentcheck",
   },
