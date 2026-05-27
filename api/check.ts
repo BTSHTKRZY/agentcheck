@@ -304,7 +304,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const prevTrust: any    = prevScoreRes.status    === "fulfilled" ? prevScoreRes.value    : null;
 
     const txList = txData?.result && Array.isArray(txData.result) ? txData.result : [];
-    const ethBalance = balData?.result
     const rawBalance = balData?.result && !isNaN(parseInt(balData.result))
       ? parseInt(balData.result)
       : 0;
