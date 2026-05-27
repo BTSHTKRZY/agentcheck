@@ -250,14 +250,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       // 1. Etherscan — transaction list
       fetch(
-        `https://api.etherscan.io/api?module=account&action=txlist&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=100&sort=asc&apikey=${ETHERSCAN_KEY}`
+        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=100&sort=asc&apikey=${ETHERSCAN_KEY}`
       ).then(r => r.json()),
-
+      
       // 2. Etherscan — ETH balance
       fetch(
-        `https://api.etherscan.io/api?module=account&action=balance&address=${wallet}&tag=latest&apikey=${ETHERSCAN_KEY}`
+        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address=${wallet}&tag=latest&apikey=${ETHERSCAN_KEY}`
       ).then(r => r.json()),
-
+      
       // 3. GetBlock — Fraud Check (risk + forensics)
       fetch(
         `https://hub-api.getblock.io/wallet-risk/fraudCheck`,
