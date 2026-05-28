@@ -515,9 +515,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         trust_breakdown: trustBreakdown,
 
         wallet_data: {
-          age_days:           ageDays,
-          first_seen:         firstSeen,
-          last_active:        lastActive,
+        age_days:           totalTx === 100 && ageDays < 180 ? null : ageDays,
+        first_seen:         totalTx === 100 && ageDays < 180 ? null : firstSeen,
+        age_note:           totalTx === 100 && ageDays < 180
+          ? "Wallet age hidden — showing 100 most recent transactions only. True age may be significantly older."
+          : null,
+        last_active:        lastActive,
+
           total_transactions: totalTx,
           success_rate:       `${Math.round(successRate * 100)}%`,
           eth_balance:        `${ethBalance} ETH`,
@@ -570,6 +574,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           declared: false,
           note:     "No permission scope declared. Submit via POST /api/scope.",
         },
+       how_to_improve: {
+        automatic: [
+          "Wallet age increases naturally over time",
+          "Each successful transaction adds to volume score",
+          "Interacting with more protocols increases diversity score",
+        ],
+        actions: [
+          "Get endorsed: POST /api/endorse",
+          "Report positive outcomes: POST /api/outcome",
+          "Declare permission scope: POST /api/scope",
+          "Register as ERC-8004 agent for +25 agent score",
+          "Pass safety certifications: POST /api/certify",
+      ],
+      methodology_url: "https://agentcheck-bice.vercel.app/api/methodology",
+    },
       },
 
       // Quick links
