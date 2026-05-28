@@ -222,7 +222,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       // Actions
       actions: {
-        report_as_malicious: `POST ${process.env.VERCEL_URL || "https://agentcheck-bice.vercel.app"}/api/flag`,
+        report_as_malicious: "POST https://agentcheck-bice.vercel.app/api/flag",
         full_rating:         `GET https://agentcheck-bice.vercel.app/api/check?wallet=${querying}`,
         human_report:        `GET https://agentcheck-bice.vercel.app/api/report?wallet=${querying}`,
       },
