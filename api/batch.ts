@@ -93,8 +93,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       duration_ms:    Date.now() - startTs,
       total:          wallets.length,
       successful:     sorted.length,
-      errors:         errors.length,
-
+      
       summary: {
         safe_to_transact:  safeCount,
         risky_or_unknown:  sorted.length - safeCount,
