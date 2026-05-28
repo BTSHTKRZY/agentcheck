@@ -6,9 +6,12 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
-const ETHERSCAN_KEY = process.env.ETHERSCAN_API_KEY || "";
-const GETBLOCK_KEY  = process.env.GETBLOCK_API_KEY  || "";
-const NORMIES_API   = "https://api.normies.art";
+const ETHERSCAN_KEY  = process.env.ETHERSCAN_API_KEY  || "";
+const GETBLOCK_KEY   = process.env.GETBLOCK_API_KEY   || "";
+const OPENSEA_KEY    = process.env.OPENSEA_API_KEY    || "";
+const NORMIES_API    = "https://api.normies.art";
+const NORMIES_CONTRACT = "0x9Eb6E2025B64f340691e424b7fe7022fFDE12438";
+const TOTAL_MINTED   = 10000;
 
 // ── RATING SCALE ──────────────────────────────────────────────────────────────
 
@@ -63,8 +66,6 @@ function computeTrustScore(data: {
   outcomesPositive: number;
   outcomesTotal:    number;
 }): { score: number; breakdown: Record<string, number> } {
-
-  // Wallet age (max 15)
   const ageScore =
     data.ageDays > 730 ? 15 :
     data.ageDays > 365 ? 12 :
@@ -72,29 +73,18 @@ function computeTrustScore(data: {
     data.ageDays > 90  ? 6  :
     data.ageDays > 30  ? 3  : 0;
 
-  // Transaction volume (max 15) — logarithmic
   const txScore = Math.min(15, Math.floor(Math.log10(Math.max(1, data.totalTx)) * 5));
 
-  // Transaction success rate (max 20)
   const successScore =
     data.successRate >= 0.98 ? 20 :
     data.successRate >= 0.95 ? 16 :
     data.successRate >= 0.90 ? 12 :
     data.successRate >= 0.80 ? 6  : 0;
 
-  // DeFi protocol diversity (max 10)
-  const defiScore = Math.min(10, data.defiProtocols * 2);
-
-  // Payment history — x402, subscriptions (max 15)
+  const defiScore    = Math.min(10, data.defiProtocols * 2);
   const paymentScore = Math.min(15, data.paymentHistory * 3);
-
-  // ERC-8257 tool usage (max 10)
-  const toolScore = Math.min(10, data.erc8257Usage * 2);
-
-  // Community endorsements (max 10)
+  const toolScore    = Math.min(10, data.erc8257Usage * 2);
   const endorseScore = Math.min(10, data.endorsements * 3);
-
-  // Outcome tracking — historical accuracy (max 5)
   const outcomeScore = data.outcomesTotal > 0
     ? Math.round((data.outcomesPositive / data.outcomesTotal) * 5)
     : 0;
@@ -128,7 +118,6 @@ function computeRiskScore(data: {
   rugPullFlag:      boolean;
   newAddress:       boolean;
 }): { score: number; flags: string[] } {
-
   let score = data.getblockRisk ?? 20;
   const flags: string[] = [];
 
@@ -142,45 +131,74 @@ function computeRiskScore(data: {
   return { score: Math.min(100, score), flags };
 }
 
-// ── AGENT SCORE (0-100) ───────────────────────────────────────────────────────
+// ── AGENT SCORE (0-100) — now includes ERC-8004 agent binding ─────────────────
 
 function computeAgentScore(data: {
-  isErc8004:      boolean;
-  hasTBA:         boolean;
-  erc8257Calls:   number;
-  agentTxCount:   number;
-  certifications: string[];
-  socialLinked:   boolean;
+  isErc8004:        boolean;
+  agentName:        string | null;
+  agentType:        string | null;
+  agentLevel:       number | null;
+  hasAgentBinding:  boolean;        // ERC-8004 binding confirmed via OpenSea API
+  agentCapabilities: string[];      // capabilities from ERC-8004 metadata
+  hasTBA:           boolean;
+  erc8257Calls:     number;
+  agentTxCount:     number;
+  certifications:   string[];
+  socialLinked:     boolean;
 }): { score: number; highlights: string[] } {
-
   let score = 0;
   const highlights: string[] = [];
 
+  // ERC-8004 registration — base agent identity
   if (data.isErc8004) {
-    score += 30;
-    highlights.push("Registered ERC-8004 agent — verified on-chain identity");
+    score += 25;
+    highlights.push(`ERC-8004 registered agent${data.agentName ? ` — ${data.agentName}` : ""}${data.agentType ? ` (${data.agentType})` : ""}`);
   }
+
+  // ERC-8004 agent binding confirmed via OpenSea API — stronger signal
+  if (data.hasAgentBinding) {
+    score += 15;
+    highlights.push("ERC-8004 agent binding confirmed via OpenSea API");
+  }
+
+  // Agent capabilities declared
+  if (data.agentCapabilities.length > 0) {
+    score += Math.min(10, data.agentCapabilities.length * 2);
+    highlights.push(`Declared capabilities: ${data.agentCapabilities.slice(0, 3).join(", ")}${data.agentCapabilities.length > 3 ? ` +${data.agentCapabilities.length - 3} more` : ""}`);
+  }
+
+  // Canvas level (Normies specific — shows investment in the ecosystem)
+  if (data.agentLevel && data.agentLevel > 1) {
+    const levelBonus = Math.min(5, Math.floor(data.agentLevel / 10));
+    score += levelBonus;
+    if (levelBonus > 0) highlights.push(`Canvas level ${data.agentLevel} — ecosystem investment`);
+  }
+
+  // TBA wallet
   if (data.hasTBA) {
-    score += 20;
+    score += 15;
     highlights.push("ERC-6551 Token Bound Account — autonomous wallet capability");
   }
 
-  const toolScore = Math.min(20, data.erc8257Calls * 4);
+  // ERC-8257 tool usage
+  const toolScore = Math.min(15, data.erc8257Calls * 4);
   score += toolScore;
   if (data.erc8257Calls > 0) {
     highlights.push(`${data.erc8257Calls} ERC-8257 tool interactions — active agent behaviour`);
   }
 
-  const agentTxScore = Math.min(15, data.agentTxCount * 3);
+  // Agent-to-agent transactions
+  const agentTxScore = Math.min(10, data.agentTxCount * 3);
   score += agentTxScore;
   if (data.agentTxCount > 0) {
     highlights.push(`${data.agentTxCount} agent-to-agent transactions recorded`);
   }
 
+  // Safety certifications — 5 points each, max 15
   const certScore = data.certifications.length * 5;
   score += Math.min(15, certScore);
   if (data.certifications.length > 0) {
-    highlights.push(`Safety certified: ${data.certifications.join(", ")}`);
+    highlights.push(`Safety certified: ${data.certifications.join(", ").replace(/_/g, " ")}`);
   }
 
   if (data.socialLinked) {
@@ -226,8 +244,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const [
       ethTxRes,
       ethBalRes,
+      ethNFTRes,
       getblockRes,
       normiesAgentRes,
+      openSeaAgentRes,
       endorsementsRes,
       outcomesRes,
       certRes,
@@ -235,7 +255,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       prevScoreRes,
     ] = await Promise.allSettled([
 
-      // 1. Etherscan — transaction list (most recent first)
+      // 1. Etherscan — recent transactions
       fetch(
         `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=100&sort=desc&apikey=${ETHERSCAN_KEY}`
       ).then(r => r.json()),
@@ -245,44 +265,55 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         `https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address=${wallet}&tag=latest&apikey=${ETHERSCAN_KEY}`
       ).then(r => r.json()),
 
-      // 3. GetBlock — Fraud Check
+      // 3. Etherscan — NFT token holdings (check for Normies)
+      fetch(
+        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=tokennfttx&address=${wallet}&contractaddress=${NORMIES_CONTRACT}&page=1&offset=10&sort=desc&apikey=${ETHERSCAN_KEY}`
+      ).then(r => r.json()),
+
+      // 4. GetBlock — fraud check
       fetch(
         `https://hub-api.getblock.io/wallet-risk/fraudCheck`,
         {
           method: "POST",
-          headers: {
-            "x-api-key": GETBLOCK_KEY,
-            "Content-Type": "application/json",
-          },
+          headers: { "x-api-key": GETBLOCK_KEY, "Content-Type": "application/json" },
           body: JSON.stringify({ address: wallet, network }),
         }
       ).then(r => r.json()).catch(() => null),
 
-      // 4. Normies API — ERC-8004 agent check
+      // 5. Normies API — ERC-8004 agent identity by wallet
       fetch(`${NORMIES_API}/agents/info/${wallet}`).then(r => r.json()).catch(() => null),
 
-      // 5. Redis — endorsements
+      // 6. OpenSea API — check for agent-bound NFTs owned by this wallet
+      // This checks ERC-8004 agent binding via OpenSea's agent metadata support
+      fetch(
+        `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?limit=50`,
+        { headers: { "x-api-key": OPENSEA_KEY, "accept": "application/json" } }
+      ).then(r => r.json()).catch(() => null),
+
+      // 7. Redis — endorsements
       redis.get(`agentcheck:endorsements:${wallet}`).catch(() => null),
 
-      // 6. Redis — outcomes
+      // 8. Redis — outcomes
       redis.get(`agentcheck:outcomes:${wallet}`).catch(() => null),
 
-      // 7. Redis — certifications
+      // 9. Redis — certifications
       redis.get(`agentcheck:certs:${wallet}`).catch(() => null),
 
-      // 8. Redis — permission scope
+      // 10. Redis — permission scope
       redis.get(`agentcheck:scope:${wallet}`).catch(() => null),
 
-      // 9. Redis — previous trust score
+      // 11. Redis — previous trust score
       redis.get(`agentcheck:prev_trust:${wallet}`).catch(() => null),
     ]);
 
-    // ── PARSE ETHERSCAN ─────────────────────────────────────────────────────
+    // ── PARSE ──────────────────────────────────────────────────────────────────
 
-    const txData  = ethTxRes.status  === "fulfilled" ? ethTxRes.value  : null;
-    const balData = ethBalRes.status === "fulfilled" ? ethBalRes.value : null;
-    const gbData  = getblockRes.status === "fulfilled" ? getblockRes.value : null;
-    const nmData  = normiesAgentRes.status === "fulfilled" ? normiesAgentRes.value : null;
+    const txData   = ethTxRes.status    === "fulfilled" ? ethTxRes.value    : null;
+    const balData  = ethBalRes.status   === "fulfilled" ? ethBalRes.value   : null;
+    const nftData  = ethNFTRes.status   === "fulfilled" ? ethNFTRes.value   : null;
+    const gbData   = getblockRes.status === "fulfilled" ? getblockRes.value : null;
+    const nmData   = normiesAgentRes.status === "fulfilled" ? normiesAgentRes.value : null;
+    const osData   = openSeaAgentRes.status === "fulfilled" ? openSeaAgentRes.value : null;
 
     const endorsements = endorsementsRes.status === "fulfilled" ? endorsementsRes.value : null;
     const outcomes     = outcomesRes.status     === "fulfilled" ? outcomesRes.value     : null;
@@ -290,39 +321,66 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const scope        = scopeRes.status        === "fulfilled" ? scopeRes.value        : null;
     const prevTrust    = prevScoreRes.status    === "fulfilled" ? prevScoreRes.value    : null;
 
+    // ── ETHERSCAN DATA ─────────────────────────────────────────────────────────
+
     const txList = txData?.result && Array.isArray(txData.result) ? txData.result : [];
 
-    // ETH balance — safe parse
     const rawBalance = balData?.result && !isNaN(parseInt(balData.result))
-      ? parseInt(balData.result)
-      : 0;
+      ? parseInt(balData.result) : 0;
     const ethBalance = (rawBalance / 1e18).toFixed(4);
 
-    // Wallet age — since we now sort desc, oldest tx is last in array
+    // Wallet age from oldest transaction in our window
     const oldestTx   = txList[txList.length - 1];
     const newestTx   = txList[0];
     const firstTsRaw = oldestTx ? parseInt(oldestTx.timeStamp) * 1000 : null;
-    const ageDays    = firstTsRaw
-      ? Math.floor((Date.now() - firstTsRaw) / 86400000)
-      : 0;
-    const firstSeen  = firstTsRaw
-      ? new Date(firstTsRaw).toISOString().split("T")[0]
-      : null;
-    const lastActive = newestTx
-      ? new Date(parseInt(newestTx.timeStamp) * 1000).toISOString().split("T")[0]
-      : null;
+    const ageDays    = firstTsRaw ? Math.floor((Date.now() - firstTsRaw) / 86400000) : 0;
+    const firstSeen  = firstTsRaw ? new Date(firstTsRaw).toISOString().split("T")[0] : null;
+    const lastActive = newestTx ? new Date(parseInt(newestTx.timeStamp) * 1000).toISOString().split("T")[0] : null;
 
-    // Transaction stats
     const totalTx     = txList.length;
     const successTx   = txList.filter((t: any) => t.isError === "0").length;
     const successRate = totalTx > 0 ? successTx / totalTx : 0;
 
-    // Unique contracts (DeFi diversity)
     const uniqueContracts = new Set(
       txList.filter((t: any) => t.to && t.input !== "0x").map((t: any) => t.to)
     ).size;
 
-    // ── PARSE GETBLOCK ──────────────────────────────────────────────────────
+    // ── OPENSEA ERC-8004 AGENT BINDING CHECK ───────────────────────────────────
+
+    let hasAgentBinding   = false;
+    let agentCapabilities: string[] = [];
+    let agentNFTs: any[]  = [];
+
+    if (osData?.nfts && Array.isArray(osData.nfts)) {
+      // Check for NFTs with agent_binding or ERC-8004 metadata
+      agentNFTs = osData.nfts.filter((nft: any) =>
+        nft.agent_binding ||
+        nft.metadata?.agent_metadata ||
+        nft.traits?.some((t: any) =>
+          t.trait_type?.toLowerCase().includes("agent") ||
+          t.trait_type?.toLowerCase().includes("skill") ||
+          t.trait_type?.toLowerCase().includes("capability")
+        )
+      );
+
+      if (agentNFTs.length > 0) {
+        hasAgentBinding = true;
+        // Extract capabilities from traits
+        agentNFTs.forEach((nft: any) => {
+          const capTraits = (nft.traits || []).filter((t: any) =>
+            ["capability", "skill", "service", "tool"].includes(
+              (t.trait_type || "").toLowerCase()
+            )
+          );
+          capTraits.forEach((t: any) => {
+            if (t.value) agentCapabilities.push(t.value);
+          });
+        });
+        agentCapabilities = [...new Set(agentCapabilities)].slice(0, 10);
+      }
+    }
+
+    // ── GETBLOCK DATA ──────────────────────────────────────────────────────────
 
     const gbRisk       = gbData?.risk_score            ?? null;
     const gbLevel      = gbData?.risk_level            ?? null;
@@ -334,24 +392,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const gbRugPull    = gbFlags.includes("rug_pull");
     const gbNewAddress = gbData?.is_new_address        ?? (ageDays < 30);
 
-    // ── PARSE NORMIES / ERC-8004 ────────────────────────────────────────────
+    // ── NORMIES / ERC-8004 ────────────────────────────────────────────────────
 
     const isErc8004  = !!(nmData && nmData.tokenId && !nmData.error);
     const agentName  = nmData?.name         || null;
     const agentType  = nmData?.type         || null;
     const agentLevel = nmData?.canvas?.level || null;
 
-    // ── PARSE REDIS ─────────────────────────────────────────────────────────
+    // Also check via Normies NFT holdings from Etherscan
+    const normiesHeld = nftData?.result && Array.isArray(nftData.result) && nftData.result.length > 0;
 
-    const endorseCount   = endorsements ? (endorsements as any).count    || 0 : 0;
+    // ── REDIS DATA ─────────────────────────────────────────────────────────────
+
+    const endorseCount   = endorsements ? (endorsements as any).count    || 0  : 0;
     const endorseList    = endorsements ? (endorsements as any).list     || [] : [];
-    const outcomesPos    = outcomes     ? (outcomes as any).positive     || 0 : 0;
-    const outcomesTotal  = outcomes     ? (outcomes as any).total        || 0 : 0;
-    const certList       = certs        ? (certs as string[])                 : [];
-    const scopeData      = scope        ? (scope as any)                      : null;
-    const prevTrustScore = prevTrust    ? parseInt(prevTrust as string)       : null;
+    const outcomesPos    = outcomes     ? (outcomes as any).positive     || 0  : 0;
+    const outcomesTotal  = outcomes     ? (outcomes as any).total        || 0  : 0;
+    const certList       = certs        ? (certs as string[])                  : [];
+    const scopeData      = scope        ? (scope as any)                       : null;
+    const prevTrustScore = prevTrust    ? parseInt(prevTrust as string)        : null;
 
-    // ── COMPUTE SCORES ──────────────────────────────────────────────────────
+    // ── COMPUTE SCORES ─────────────────────────────────────────────────────────
 
     const { score: trustScore, breakdown: trustBreakdown } = computeTrustScore({
       ageDays,
@@ -377,43 +438,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const { score: agentScore, highlights: agentHighlights } = computeAgentScore({
       isErc8004,
-      hasTBA:         false,
-      erc8257Calls:   0,
-      agentTxCount:   0,
-      certifications: certList,
-      socialLinked:   false,
+      agentName,
+      agentType,
+      agentLevel,
+      hasAgentBinding,
+      agentCapabilities,
+      hasTBA:           false,
+      erc8257Calls:     0,
+      agentTxCount:     0,
+      certifications:   certList,
+      socialLinked:     false,
     });
 
     const rawComposite = compositeScore(trustScore, riskScore, agentScore);
 
-    // Floor: wallets with no serious flags and real tx history never go below BB (50)
-    const hasRealHistory    = ageDays > 0 && totalTx > 0;
-    const hasSeriousFlag    = gbSanctioned || gbMixer || gbDarkweb || gbPhishing || gbRugPull;
+    // Floor: wallets with real history and no serious flags never go below BB
+    const hasRealHistory = ageDays > 0 && totalTx > 0;
+    const hasSeriousFlag = gbSanctioned || gbMixer || gbDarkweb || gbPhishing || gbRugPull;
     const adjustedComposite = (hasRealHistory && !hasSeriousFlag)
       ? Math.max(rawComposite, 50)
       : rawComposite;
 
     const rating       = compositeToLetter(adjustedComposite);
-    const verdict      = letterToVerdict(rating, isErc8004);
+    const verdict      = letterToVerdict(rating, isErc8004 || hasAgentBinding);
     const scoreOutlook = outlook(trustScore, prevTrustScore);
 
-    // ── BUILD HIGHLIGHTS ────────────────────────────────────────────────────
+    // ── BUILD HIGHLIGHTS ───────────────────────────────────────────────────────
 
     const highlights: string[] = [];
-    if (ageDays > 0)       highlights.push(`Wallet active ${ageDays} days${firstSeen ? ` since ${firstSeen}` : ""}`);
-    if (totalTx > 0)       highlights.push(`${totalTx} recent transactions · ${Math.round(successRate * 100)}% success rate`);
-    if (parseFloat(ethBalance) > 0) highlights.push(`Current balance: ${ethBalance} ETH`);
-    if (uniqueContracts)   highlights.push(`${uniqueContracts} unique contracts interacted with`);
-    if (isErc8004)         highlights.push(`ERC-8004 registered agent${agentName ? ` — ${agentName}` : ""}${agentType ? ` (${agentType})` : ""}`);
-    if (endorseCount > 0)  highlights.push(`${endorseCount} community endorsements received`);
-    if (outcomesTotal > 0) highlights.push(`${outcomesPos}/${outcomesTotal} verified transactions resolved positively`);
+    if (ageDays > 0)                    highlights.push(`Wallet active ${ageDays} days${firstSeen ? ` since ${firstSeen}` : ""}`);
+    if (totalTx > 0)                    highlights.push(`${totalTx} recent transactions · ${Math.round(successRate * 100)}% success rate`);
+    if (parseFloat(ethBalance) > 0)     highlights.push(`Current balance: ${ethBalance} ETH`);
+    if (uniqueContracts)                highlights.push(`${uniqueContracts} unique contracts interacted with`);
+    if (normiesHeld)                    highlights.push("Normies NFT holder — ecosystem participant");
+    if (endorseCount > 0)               highlights.push(`${endorseCount} community endorsements received`);
+    if (outcomesTotal > 0)              highlights.push(`${outcomesPos}/${outcomesTotal} verified transactions resolved positively`);
     highlights.push(...agentHighlights);
 
-    // ── STORE CHECK IN REDIS ─────────────────────────────────────────────────
+    // ── STORE IN REDIS ─────────────────────────────────────────────────────────
 
     const checkRecord = {
-      wallet,
-      network,
+      wallet, network,
       trust_score:  trustScore,
       risk_score:   riskScore,
       agent_score:  agentScore,
@@ -429,7 +494,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       redis.incr("agentcheck:total_checks"),
     ]).catch(() => {});
 
-    // ── RESPONSE ─────────────────────────────────────────────────────────────
+    // ── RESPONSE ───────────────────────────────────────────────────────────────
 
     return res.status(200).json({
       wallet,
@@ -457,6 +522,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           success_rate:       `${Math.round(successRate * 100)}%`,
           eth_balance:        `${ethBalance} ETH`,
           unique_contracts:   uniqueContracts,
+          normies_holder:     normiesHeld,
           note:               "Transaction data shows most recent 100 transactions via Etherscan.",
         },
 
@@ -467,16 +533,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           sanctioned: gbSanctioned,
         },
 
-        agent_identity: isErc8004 ? {
-          registered: true,
-          standard:   "ERC-8004",
-          name:       agentName,
-          type:       agentType,
-          level:      agentLevel,
-        } : {
-          registered: false,
-          standard:   null,
-          note:       "Not a registered ERC-8004 agent",
+        // ERC-8004 + ERC-8217 agent identity — combined
+        agent_identity: {
+          is_agent:           isErc8004 || hasAgentBinding,
+          erc8004_registered: isErc8004,
+          agent_binding:      hasAgentBinding,
+          name:               agentName,
+          type:               agentType,
+          level:              agentLevel,
+          capabilities:       agentCapabilities,
+          agent_nfts_held:    agentNFTs.length,
+          note: !isErc8004 && !hasAgentBinding
+            ? "Not a registered ERC-8004 agent"
+            : hasAgentBinding && !isErc8004
+            ? "Agent binding confirmed via OpenSea API (ERC-8004 metadata)"
+            : "ERC-8004 registered agent with on-chain identity",
         },
 
         certifications: {
@@ -501,8 +572,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
       },
 
-      methodology: "https://github.com/BTSHTKRZY/agentcheck#methodology",
-      powered_by:  ["Etherscan v2", "GetBlock Fraud Check", "Normies ERC-8004 Registry"],
+      // Quick links
+      human_report: `https://agentcheck-bice.vercel.app/api/report?wallet=${wallet}`,
+      methodology:  "https://github.com/BTSHTKRZY/agentcheck#methodology",
+      powered_by:   ["Etherscan v2", "GetBlock Fraud Check", "Normies ERC-8004 Registry", "OpenSea Agent API"],
     });
 
   } catch (err: any) {
