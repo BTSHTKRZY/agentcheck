@@ -160,40 +160,51 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // GET — retrieve certification status
   if (req.method === "GET") {
-    const wallet = (req.query?.wallet || "").toString().toLowerCase().trim();
-    if (!wallet || !wallet.startsWith("0x")) {
-      return res.status(400).json({ error: "Valid wallet address required" });
-    }
-    try {
-      const w             = wallet.toLowerCase();
-      const certs: any        = await redis.get(`agentcheck:certs:${w}`).catch(() => null);
-      const certDetails: any  = await redis.get(`agentcheck:cert_details:${w}`).catch(() => null);
-      const certifiedAt       = certDetails?.certified_at || null;
-      const expired           = certifiedAt
-        ? (Date.now() - new Date(certifiedAt).getTime()) > CERT_EXPIRY_DAYS * 24 * 60 * 60 * 1000
-        : false;
-      const expiresAt         = certifiedAt
-        ? new Date(new Date(certifiedAt).getTime() + CERT_EXPIRY_DAYS * 24 * 60 * 60 * 1000).toISOString()
-        : null;
-
-      return res.status(200).json({
-        wallet,
-        certifications: {
-          passed:          certs || [],
-          total:           (certs || []).length,
-          all_passed:      (certs || []).length === 3,
-          expired,
-          certified_at:    certifiedAt,
-          expires_at:      expiresAt,
-          battery_version: certDetails?.battery_version || null,
-          on_chain_hash:   certDetails?.on_chain_hash   || null,
-        },
-        submit_url: "POST /api/certify with { wallet, agent_endpoint } to run tests",
-      });
-    } catch (err: any) {
-      return res.status(500).json({ error: err.message });
-    }
+  const wallet = (req.query?.wallet || "").toString().toLowerCase().trim();
+  if (!wallet || !wallet.startsWith("0x")) {
+    return res.status(400).json({ error: "Valid wallet address required" });
   }
+  try {
+    const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL!;
+    const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
+
+    const [certsRes, detailsRes] = await Promise.all([
+      fetch(`${REDIS_URL}/get/agentcheck:certs:${wallet}`, {
+        headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+      }).then(r => r.json()),
+      fetch(`${REDIS_URL}/get/agentcheck:cert_details:${wallet}`, {
+        headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+      }).then(r => r.json()),
+    ]);
+
+    const certs       = certsRes?.result      ? JSON.parse(certsRes.result)      : null;
+    const certDetails = detailsRes?.result    ? JSON.parse(detailsRes.result)    : null;
+    const certifiedAt = certDetails?.certified_at || null;
+    const expired     = certifiedAt
+      ? (Date.now() - new Date(certifiedAt).getTime()) > CERT_EXPIRY_DAYS * 24 * 60 * 60 * 1000
+      : false;
+    const expiresAt   = certifiedAt
+      ? new Date(new Date(certifiedAt).getTime() + CERT_EXPIRY_DAYS * 24 * 60 * 60 * 1000).toISOString()
+      : null;
+
+    return res.status(200).json({
+      wallet,
+      certifications: {
+        passed:          certs || [],
+        total:           (certs || []).length,
+        all_passed:      (certs || []).length === 3,
+        expired,
+        certified_at:    certifiedAt,
+        expires_at:      expiresAt,
+        battery_version: certDetails?.battery_version || null,
+        on_chain_hash:   certDetails?.on_chain_hash   || null,
+      },
+      submit_url: "POST /api/certify with { wallet, agent_endpoint } to run tests",
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+}
 
   if (req.method !== "POST") return res.status(405).json({ error: "POST or GET only" });
 
