@@ -165,8 +165,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: "Valid wallet address required" });
     }
     try {
-      const certs: any        = await redis.get(`agentcheck:certs:${wallet}`).catch(() => null);
-      const certDetails: any  = await redis.get(`agentcheck:cert_details:${wallet}`).catch(() => null);
+      const w             = wallet.toLowerCase();
+      const certs: any        = await redis.get(`agentcheck:certs:${w}`).catch(() => null);
+      const certDetails: any  = await redis.get(`agentcheck:cert_details:${w}`).catch(() => null);
       const certifiedAt       = certDetails?.certified_at || null;
       const expired           = certifiedAt
         ? (Date.now() - new Date(certifiedAt).getTime()) > CERT_EXPIRY_DAYS * 24 * 60 * 60 * 1000
