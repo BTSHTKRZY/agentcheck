@@ -336,22 +336,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const certString  = JSON.stringify(certRecord);
   const certHash    = `0x${Buffer.from(certString).toString("hex").slice(0, 64)}`;
 
-  await Promise.all([
-    redis.set(`agentcheck:certs:${wallet.toLowerCase()}`, allCerts),
-    redis.set(`agentcheck:cert_details:${wallet.toLowerCase()}`, {
+  const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL!;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
+const w = wallet.toLowerCase();
+
+await Promise.all([
+  fetch(`${REDIS_URL}/set/${encodeURIComponent(`agentcheck:certs:${w}`)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(allCerts),
+  }),
+  fetch(`${REDIS_URL}/set/${encodeURIComponent(`agentcheck:cert_details:${w}`)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
       ...certRecord,
-      on_chain_hash:   certHash,
-      latest_results:  results,
+      on_chain_hash:  certHash,
+      latest_results: results,
     }),
-    redis.lpush("agentcheck:cert_log", JSON.stringify({
-      wallet:       wallet.toLowerCase(),
+  }),
+  fetch(`${REDIS_URL}/lpush/${encodeURIComponent("agentcheck:cert_log")}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(JSON.stringify({
+      wallet:       w,
       certs_passed: newCerts,
       cert_hash:    certHash,
       ts:           Date.now(),
     })),
-    redis.ltrim("agentcheck:cert_log", 0, 999),
-  ]).catch(() => {});
-
+  }),
+]).catch(e => console.error("Redis write error:", e));
+  
   const totalTests  = Object.values(results).reduce((s: number, r: any) => s + r.tests_run, 0);
   const totalPassed = Object.values(results).reduce((s: number, r: any) => s + r.tests_passed, 0);
   const overallScore = Math.round(
