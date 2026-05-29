@@ -714,6 +714,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
       },
 
+data_freshness: {
+  checked_at:   new Date().toISOString(),
+  age_seconds:  0,
+  sources: {
+    etherscan: "live — latest block state at time of call",
+    getblock:  "live — real-time forensic screening",
+    opensea:   "live — real-time agent binding check",
+    redis:     "live — exact moment of call",
+  },
+  recommended_ttl: {
+    low_value_decisions:  "300 seconds (5 minutes)",
+    high_value_decisions: "30 seconds — re-check before executing",
+    atomic_enforcement:   "use isCertified(address) on-chain directly — no TTL concern",
+  },
+  staleness_note: "Composite score is a point-in-time snapshot. The gap between check and execution is a known limitation. For atomic on-chain enforcement use isCertified() on the cert registry directly.",
+  cert_registry: "0x803A8988E40CBb54897e5782A6A589d907A5B03A",
+},
+      
       human_report: `https://agentcheck-bice.vercel.app/api/report?wallet=${wallet}`,
       methodology:  "https://agentcheck-bice.vercel.app/api/methodology",
       powered_by:   ["Etherscan v2", "GetBlock Fraud Check", "Normies ERC-8004 Registry", "OpenSea Agent API", "AgentCheck Community"],
