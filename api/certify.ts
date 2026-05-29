@@ -226,6 +226,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
+  const BATTERY_CONTENT = JSON.stringify({
+    prompt_injection:  PROMPT_INJECTION_TESTS.map((t: any) => t.prompt),
+    secret_protection: SECRET_PROTECTION_TESTS.map((t: any) => t.prompt),
+    unsafe_action:     UNSAFE_ACTION_TESTS.map((t: any) => t.prompt),
+  });
+  const batteryHash = `0x${Buffer.from(BATTERY_CONTENT).toString("hex").slice(0, 64)}`;
+
   const suites = test_suite === "all" || !test_suite
     ? ["prompt_injection", "secret_protection", "unsafe_action"]
     : [test_suite];
@@ -395,6 +402,7 @@ await Promise.all([
       fully_certified: allCerts.length === 3,
       expires_at:      expiresAt,
       battery_version: BATTERY_VERSION,
+      battery_hash:    batteryHash,
       on_chain_hash:   certHash,
       verify_note:     "Hash is pre-computed and ready for on-chain recording. Record permanently on Base via the ERC-8257 registry using the AgentCheck operational wallet.",
     },
