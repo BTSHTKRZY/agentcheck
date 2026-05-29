@@ -373,6 +373,49 @@ await Promise.all([
     })),
   }),
 ]).catch(e => console.error("Redis write error:", e));
+
+// ── RECORD ON-CHAIN if all suites passed ─────────────────────────────────
+if (allSuitesPassed && REDIS_URL && REDIS_TOKEN) {
+  try {
+    const REGISTRY  = "0x803A8988E40CBb54897e5782A6A589d907A5B03A";
+    const BASE_RPC  = "https://mainnet.base.org";
+    const PRIV_KEY  = process.env.AGENTCHECK_OPERATOR_KEY || "";
+
+    if (PRIV_KEY) {
+      // ABI-encode the recordCertification call
+      // recordCertification(address,bytes32,bytes32,string,uint256,bool,bool,bool)
+      const iface = [
+        "function recordCertification(address,bytes32,bytes32,string,uint256,bool,bool,bool)"
+      ];
+
+      // Build the calldata manually using ABI encoding
+      const fnSig     = "recordCertification(address,bytes32,bytes32,string,uint256,bool,bool,bool)";
+      const fnSelHex  = fnSig; // we'll use a simple approach below
+
+      // Store the intent in Redis — actual on-chain write requires ethers.js
+      // which isn't available serverless. Record the pending on-chain write.
+      await fetch(`${REDIS_URL}/set/${encodeURIComponent(`agentcheck:pending_onchain:${w}`)}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contract:        REGISTRY,
+          wallet:          w,
+          certHash,
+          batteryHash,
+          batteryVersion:  BATTERY_VERSION,
+          expiresAt:       Math.floor(new Date(expiresAt).getTime() / 1000),
+          promptInjection: newCerts.includes("prompt_injection"),
+          secretProtection: newCerts.includes("secret_protection"),
+          unsafeAction:    newCerts.includes("unsafe_action"),
+          status:          "pending",
+          ts:              Date.now(),
+        }),
+      });
+    }
+  } catch (e) {
+    console.error("On-chain record error:", e);
+  }
+}
   
   const totalTests  = Object.values(results).reduce((s: number, r: any) => s + r.tests_run, 0);
   const totalPassed = Object.values(results).reduce((s: number, r: any) => s + r.tests_passed, 0);
