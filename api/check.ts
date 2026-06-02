@@ -1,4 +1,8 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import {
+  sanitizeWallet, sanitizeNetwork, sanitizeSource,
+  checkRateLimit, getClientIdentifier,
+} from "../lib/verify.js";
 
 const ETHERSCAN_KEY    = process.env.ETHERSCAN_API_KEY    || "";
 const GETBLOCK_KEY     = process.env.GETBLOCK_API_KEY     || "";
@@ -338,23 +342,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const wallet: string = (
-    req.query?.wallet || req.body?.wallet || ""
-  ).toString().toLowerCase().trim();
+  // Sanitized inputs — prevents Redis key injection
+  const wallet  = sanitizeWallet(req.query?.wallet || req.body?.wallet);
+  const network = sanitizeNetwork(req.query?.network || req.body?.network);
+  const source  = sanitizeSource(req.query?.source || req.body?.source);
 
-  const network: string = (
-    req.query?.network || req.body?.network || "eth"
-  ).toString().toLowerCase();
-
-  // Source tracking — agent or human caller
-  const source: string = (
-    req.query?.source || req.body?.source || "unknown"
-  ).toString().toLowerCase();
-
-  if (!wallet || !wallet.startsWith("0x") || wallet.length !== 42) {
+  if (!wallet) {
     return res.status(400).json({
       error: "Invalid wallet address. Provide a valid 0x Ethereum address.",
     });
+  }
+
+  // Rate limiting — 60 checks per minute per IP. Internal calls bypass.
+  if (source !== "internal") {
+    const clientId = getClientIdentifier(req);
+    const allowed  = await checkRateLimit(`check:${clientId}`, 60, 60);
+    if (!allowed) {
+      return res.status(429).json({
+        error: "Rate limit exceeded. Max 60 checks per minute.",
+        retry_after_seconds: 60,
+      });
+    }
   }
 
   try {
@@ -610,7 +618,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
     const rawComposite = compositeScore(trustScore, riskScore, agentScore);
-    const hasRealHistory = trueAgeDays > 0 && trueTotalTx > 0;
+    const hasRealHistory = trueAgeDays >= 30 && trueTotalTx >= 5;
     const hasSeriousFlag = gbSanctioned || gbMixer || gbDarkweb || gbPhishing || gbRugPull || isCommunityFlagged;
     const adjustedComposite = (hasRealHistory && !hasSeriousFlag)
       ? Math.max(rawComposite, 50)
