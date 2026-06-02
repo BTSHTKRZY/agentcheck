@@ -3,7 +3,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 const MANIFEST = {
   type: "https://ercs.ethereum.org/ERCS/erc-8257#tool-manifest-v1",
   name: "agent-check",
-  description: "Trust rating agency for the agent economy. Rates any Ethereum wallet AAA to D. Trust score (on-chain history), risk score (sanctions + forensics), agent score (ERC-8004 + certifications). Threat detection, batch check, monitoring, endorsements, outcomes, permission scope. Certification suite: prompt injection, secret protection, unsafe action gating. Open access.",
+  description: "Trust rating agency for the agent economy. Rates any Ethereum wallet AAA to D. Trust score includes ERC-8257 tool usage on Base and wallet relationship graph. Forensic screening, ERC-8004 identity, safety certifications (battery v1.1, on-chain hash). Predicate: 0x38530729. Open access.",
   endpoint: "https://agentcheck-bice.vercel.app/api/check",
   verifiability: {
     tier: "self-attested",
