@@ -1,24 +1,56 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { Redis } from "@upstash/redis";
-
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL!,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-});
 
 const ETHERSCAN_KEY    = process.env.ETHERSCAN_API_KEY    || "";
 const GETBLOCK_KEY     = process.env.GETBLOCK_API_KEY     || "";
 const OPENSEA_KEY      = process.env.OPENSEA_API_KEY      || "";
 const NORMIES_API      = "https://api.normies.art";
 const NORMIES_CONTRACT = "0x9Eb6E2025B64f340691e424b7fe7022fFDE12438";
-
-// ERC-6551 registry contract — deployed on Ethereum mainnet
 const ERC6551_REGISTRY = "0x000000006551c19487814612e58FE06813775758";
+const ERC8257_REGISTRY = "0x265BB2DBFC0A8165C9A1941Eb1372F349baD2cf1";
+const BASE_RPC         = "https://mainnet.base.org";
+const REDIS_URL        = process.env.UPSTASH_REDIS_REST_URL!;
+const REDIS_TOKEN      = process.env.UPSTASH_REDIS_REST_TOKEN!;
 
-// Known x402 payment contract addresses
-const X402_CONTRACTS = [
-  "0x1337def18c680af1f9f45cbcab6309562975b1dd", // x402 mainnet
-];
+// ── REDIS HELPERS ─────────────────────────────────────────────────────────────
+
+async function redisGet(key: string): Promise<any> {
+  try {
+    const res  = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+    const data = await res.json() as any;
+    return data?.result ? JSON.parse(data.result) : null;
+  } catch { return null; }
+}
+
+async function redisSet(key: string, value: any): Promise<void> {
+  try {
+    await fetch(`${REDIS_URL}/set/${encodeURIComponent(key)}`, {
+      method:  "POST",
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
+      body:    JSON.stringify(value),
+    });
+  } catch {}
+}
+
+async function redisPush(key: string, value: any): Promise<void> {
+  try {
+    await fetch(`${REDIS_URL}/lpush/${encodeURIComponent(key)}`, {
+      method:  "POST",
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
+      body:    JSON.stringify(JSON.stringify(value)),
+    });
+  } catch {}
+}
+
+async function redisIncr(key: string): Promise<void> {
+  try {
+    await fetch(`${REDIS_URL}/incr/${encodeURIComponent(key)}`, {
+      method:  "POST",
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+  } catch {}
+}
 
 // ── RATING SCALE ──────────────────────────────────────────────────────────────
 
@@ -36,18 +68,18 @@ function compositeToLetter(composite: number): string {
 }
 
 function letterToVerdict(letter: string, isAgent: boolean): string {
-  const entity = isAgent ? "agent" : "wallet";
+  const e = isAgent ? "agent" : "wallet";
   switch (letter) {
-    case "AAA": return `Exceptional ${entity}. Highest trust. Safe to transact.`;
-    case "AA":  return `Strong ${entity}. Established track record. Safe to transact.`;
-    case "A":   return `Good ${entity}. Solid history. Generally safe to transact.`;
-    case "BBB": return `Adequate ${entity}. Limited history but no adverse flags.`;
-    case "BB":  return `Speculative ${entity}. Proceed with caution and smaller amounts.`;
-    case "B":   return `Weak ${entity}. Significant gaps or minor concerns. Exercise caution.`;
-    case "CCC": return `Poor ${entity}. Active risk flags present. Avoid high-value transactions.`;
-    case "CC":  return `Very poor ${entity}. Multiple serious flags. Do not transact.`;
+    case "AAA": return `Exceptional ${e}. Highest trust. Safe to transact.`;
+    case "AA":  return `Strong ${e}. Established track record. Safe to transact.`;
+    case "A":   return `Good ${e}. Solid history. Generally safe to transact.`;
+    case "BBB": return `Adequate ${e}. Limited history but no adverse flags.`;
+    case "BB":  return `Speculative ${e}. Proceed with caution and smaller amounts.`;
+    case "B":   return `Weak ${e}. Significant gaps or minor concerns. Exercise caution.`;
+    case "CCC": return `Poor ${e}. Active risk flags present. Avoid high-value transactions.`;
+    case "CC":  return `Very poor ${e}. Multiple serious flags. Do not transact.`;
     case "C":   return `High risk. Known adverse activity. Do not transact.`;
-    case "D":   return `Defaulted or confirmed malicious. Do not transact under any circumstances.`;
+    case "D":   return `Confirmed malicious or sanctioned. Do not transact under any circumstances.`;
     default:    return "Insufficient data to rate.";
   }
 }
@@ -63,31 +95,27 @@ function outlookCalc(trust: number, prev: number | null): string {
 // ── TRUST SCORE ───────────────────────────────────────────────────────────────
 
 function computeTrustScore(data: {
-  ageDays:          number;
-  totalTx:          number;
-  successRate:      number;
-  defiProtocols:    number;
-  paymentHistory:   number;
-  erc8257Usage:     number;
-  endorsements:     number;
-  outcomesPositive: number;
-  outcomesTotal:    number;
-  x402Payments:     number;
+  ageDays:            number;
+  totalTx:            number;
+  successRate:        number;
+  defiProtocols:      number;
+  endorsements:       number;
+  outcomesPositive:   number;
+  outcomesTotal:      number;
+  erc8257Calls:       number;   // NEW — ERC-8257 tool usage
+  counterpartyAvgScore: number; // NEW — wallet relationship graph
 }): { score: number; breakdown: Record<string, number> } {
 
-  // Wallet age (max 15)
   const ageScore =
-    data.ageDays > 1460 ? 15 :  // 4+ years
-    data.ageDays > 730  ? 13 :  // 2+ years
-    data.ageDays > 365  ? 11 :  // 1+ year
+    data.ageDays > 1460 ? 15 :
+    data.ageDays > 730  ? 13 :
+    data.ageDays > 365  ? 11 :
     data.ageDays > 180  ? 8  :
     data.ageDays > 90   ? 5  :
     data.ageDays > 30   ? 2  : 0;
 
-  // Transaction volume (max 15) — logarithmic, now benefits from Pro full history
   const txScore = Math.min(15, Math.floor(Math.log10(Math.max(1, data.totalTx)) * 4));
 
-  // Success rate (max 20)
   const successScore =
     data.successRate >= 0.99 ? 20 :
     data.successRate >= 0.97 ? 18 :
@@ -95,37 +123,36 @@ function computeTrustScore(data: {
     data.successRate >= 0.90 ? 10 :
     data.successRate >= 0.80 ? 5  : 0;
 
-  // DeFi protocol diversity (max 10)
   const defiScore    = Math.min(10, data.defiProtocols * 2);
-
-  // x402 payment history (max 10) — now wired up
-  const x402Score    = Math.min(10, data.x402Payments * 2);
-
-  // ERC-8257 tool usage (max 10)
-  const toolScore    = Math.min(10, data.erc8257Usage * 2);
-
-  // Community endorsements (max 10)
   const endorseScore = Math.min(10, data.endorsements * 3);
-
-  // Outcome tracking (max 5)
   const outcomeScore = data.outcomesTotal > 0
     ? Math.round((data.outcomesPositive / data.outcomesTotal) * 5)
     : 0;
 
-  const score = ageScore + txScore + successScore + defiScore +
-                x402Score + toolScore + endorseScore + outcomeScore;
+  // ERC-8257 tool usage — max 10 pts
+  const toolScore = Math.min(10, data.erc8257Calls * 2);
+
+  // Wallet relationship graph — max 10 pts
+  // Average score of counterparties maps to trust signal
+  const relationshipScore = data.counterpartyAvgScore > 0
+    ? Math.round((data.counterpartyAvgScore / 100) * 10)
+    : 0;
+
+  const score =
+    ageScore + txScore + successScore + defiScore +
+    endorseScore + outcomeScore + toolScore + relationshipScore;
 
   return {
     score: Math.min(100, score),
     breakdown: {
-      wallet_age:         ageScore,
-      transaction_volume: txScore,
-      success_rate:       successScore,
-      defi_diversity:     defiScore,
-      x402_payments:      x402Score,
-      tool_usage:         toolScore,
-      endorsements:       endorseScore,
-      outcome_accuracy:   outcomeScore,
+      wallet_age:           ageScore,
+      transaction_volume:   txScore,
+      success_rate:         successScore,
+      defi_diversity:       defiScore,
+      endorsements:         endorseScore,
+      outcome_accuracy:     outcomeScore,
+      erc8257_tool_usage:   toolScore,
+      relationship_graph:   relationshipScore,
     },
   };
 }
@@ -141,23 +168,23 @@ function computeRiskScore(data: {
   rugPullFlag:         boolean;
   newAddress:          boolean;
   communityFlagged:    boolean;
-  counterpartyRisk:    number; // 0-100, avg risk of top counterparties
+  counterpartyRisk:    number;
 }): { score: number; flags: string[] } {
 
   let score = data.getblockRisk ?? 20;
   const flags: string[] = [];
 
-  if (data.sanctioned)         { score = 100; flags.push("sanctioned_entity"); }
-  if (data.darkwebFlag)        { score = Math.max(score, 90); flags.push("darkweb_interaction"); }
-  if (data.phishingFlag)       { score = Math.max(score, 80); flags.push("phishing_association"); }
-  if (data.rugPullFlag)        { score = Math.max(score, 85); flags.push("rug_pull_history"); }
-  if (data.mixerInteraction)   { score = Math.max(score, 75); flags.push("mixer_interaction"); }
-  if (data.communityFlagged)   { score = Math.max(score, 70); flags.push("community_flagged"); }
+  if (data.sanctioned)            { score = 100; flags.push("sanctioned_entity"); }
+  if (data.darkwebFlag)           { score = Math.max(score, 90); flags.push("darkweb_interaction"); }
+  if (data.phishingFlag)          { score = Math.max(score, 80); flags.push("phishing_association"); }
+  if (data.rugPullFlag)           { score = Math.max(score, 85); flags.push("rug_pull_history"); }
+  if (data.mixerInteraction)      { score = Math.max(score, 75); flags.push("mixer_interaction"); }
+  if (data.communityFlagged)      { score = Math.max(score, 70); flags.push("community_flagged"); }
   if (data.counterpartyRisk > 60) {
     score = Math.max(score, 50);
-    flags.push(`high_risk_counterparties (avg risk: ${data.counterpartyRisk})`);
+    flags.push(`high_risk_counterparties`);
   }
-  if (data.newAddress)         { flags.push("new_address_limited_history"); }
+  if (data.newAddress) flags.push("new_address_limited_history");
 
   return { score: Math.min(100, score), flags };
 }
@@ -173,10 +200,8 @@ function computeAgentScore(data: {
   agentCapabilities:  string[];
   hasTBA:             boolean;
   erc8257Calls:       number;
-  agentTxCount:       number;
   certifications:     string[];
   certExpired:        boolean;
-  socialLinked:       boolean;
 }): { score: number; highlights: string[] } {
 
   let score = 0;
@@ -184,40 +209,31 @@ function computeAgentScore(data: {
 
   if (data.isErc8004) {
     score += 25;
-    highlights.push(`ERC-8004 registered agent${data.agentName ? ` — ${data.agentName}` : ""}${data.agentType ? ` (${data.agentType})` : ""}`);
+    highlights.push(`ERC-8004 registered${data.agentName ? ` — ${data.agentName}` : ""}${data.agentType ? ` (${data.agentType})` : ""}`);
   }
   if (data.hasAgentBinding) {
     score += 15;
-    highlights.push("ERC-8004 agent binding confirmed via OpenSea API");
+    highlights.push("Agent binding confirmed via OpenSea API");
   }
   if (data.agentCapabilities.length > 0) {
     score += Math.min(10, data.agentCapabilities.length * 2);
-    highlights.push(`Declared capabilities: ${data.agentCapabilities.slice(0, 3).join(", ")}`);
+    highlights.push(`Capabilities: ${data.agentCapabilities.slice(0, 3).join(", ")}`);
   }
   if (data.hasTBA) {
     score += 15;
-    highlights.push("ERC-6551 Token Bound Account — autonomous wallet confirmed");
+    highlights.push("ERC-6551 Token Bound Account confirmed");
   }
   if (data.erc8257Calls > 0) {
-    const s = Math.min(15, data.erc8257Calls * 4);
-    score += s;
-    highlights.push(`${data.erc8257Calls} ERC-8257 tool interactions`);
+    const s = Math.min(15, data.erc8257Calls * 3);
+    score  += s;
+    highlights.push(`${data.erc8257Calls} ERC-8257 registry interactions`);
   }
-  if (data.agentTxCount > 0) {
-    score += Math.min(10, data.agentTxCount * 3);
-    highlights.push(`${data.agentTxCount} agent-to-agent transactions`);
-  }
-
-  // Certifications — 5 points each but only if not expired
   if (data.certifications.length > 0 && !data.certExpired) {
-    const s = Math.min(15, data.certifications.length * 5);
-    score += s;
+    score += Math.min(15, data.certifications.length * 5);
     highlights.push(`Safety certified: ${data.certifications.join(", ").replace(/_/g, " ")}`);
   } else if (data.certifications.length > 0 && data.certExpired) {
     highlights.push("Safety certifications EXPIRED — recertification required");
   }
-
-  if (data.socialLinked) highlights.push("Social presence linked");
 
   return { score: Math.min(100, score), highlights };
 }
@@ -226,6 +242,89 @@ function computeAgentScore(data: {
 
 function compositeScore(trust: number, risk: number, agent: number): number {
   return Math.round(trust * 0.5 + (100 - risk) * 0.3 + agent * 0.2);
+}
+
+// ── ERC-8257 TOOL USAGE (Base network) ───────────────────────────────────────
+
+async function getErc8257Usage(wallet: string): Promise<number> {
+  try {
+    // Check Base network for transactions to the ERC-8257 registry
+    const res  = await fetch(
+      `https://api.etherscan.io/v2/api?chainid=8453&module=account&action=txlist&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=50&sort=desc&apikey=${ETHERSCAN_KEY}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    const data = await res.json() as any;
+    const txs  = Array.isArray(data?.result) ? data.result : [];
+
+    const registryCalls = txs.filter((tx: any) =>
+      tx.to?.toLowerCase() === ERC8257_REGISTRY.toLowerCase() &&
+      tx.isError === "0"
+    ).length;
+
+    return registryCalls;
+  } catch {
+    return 0;
+  }
+}
+
+// ── WALLET RELATIONSHIP GRAPH ─────────────────────────────────────────────────
+
+async function getRelationshipGraph(
+  wallet:       string,
+  counterparties: string[]
+): Promise<{
+  avgScore:        number;
+  checkedCount:    number;
+  trustedCount:    number;
+  riskyCount:      number;
+  details:         Array<{ wallet: string; rating: string; composite: number }>;
+}> {
+  if (counterparties.length === 0) {
+    return { avgScore: 0, checkedCount: 0, trustedCount: 0, riskyCount: 0, details: [] };
+  }
+
+  // Check top 10 counterparties via AgentCheck batch
+  const top10 = counterparties.slice(0, 10);
+
+  try {
+    const res  = await fetch(
+      `https://agentcheck-bice.vercel.app/api/batch`,
+      {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ wallets: top10, network: "eth" }),
+        signal:  AbortSignal.timeout(15000),
+      }
+    );
+    const data    = await res.json() as any;
+    const results = data?.results || [];
+
+    if (results.length === 0) {
+      return { avgScore: 0, checkedCount: 0, trustedCount: 0, riskyCount: 0, details: [] };
+    }
+
+    const details = results.map((r: any) => ({
+      wallet:    r.wallet,
+      rating:    r.rating    || "UNKNOWN",
+      composite: r.composite || 0,
+    }));
+
+    const avgScore    = Math.round(
+      details.reduce((s: number, r: any) => s + r.composite, 0) / details.length
+    );
+    const trustedCount = details.filter((r: any) => r.composite >= 60).length;
+    const riskyCount   = details.filter((r: any) => r.composite < 40).length;
+
+    return {
+      avgScore,
+      checkedCount: details.length,
+      trustedCount,
+      riskyCount,
+      details: details.slice(0, 5), // return top 5 in response
+    };
+  } catch {
+    return { avgScore: 0, checkedCount: 0, trustedCount: 0, riskyCount: 0, details: [] };
+  }
 }
 
 // ── MAIN HANDLER ──────────────────────────────────────────────────────────────
@@ -247,6 +346,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     req.query?.network || req.body?.network || "eth"
   ).toString().toLowerCase();
 
+  // Source tracking — agent or human caller
+  const source: string = (
+    req.query?.source || req.body?.source || "unknown"
+  ).toString().toLowerCase();
+
   if (!wallet || !wallet.startsWith("0x") || wallet.length !== 42) {
     return res.status(400).json({
       error: "Invalid wallet address. Provide a valid 0x Ethereum address.",
@@ -255,229 +359,170 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     const [
-      // Etherscan Pro — full history (no offset limit with Pro)
       ethTxRes,
-      ethTxCountRes,
-      ethBalRes,
       ethFirstTxRes,
+      ethBalRes,
       ethInternalRes,
       getblockRes,
       normiesAgentRes,
       openSeaAgentRes,
-      endorsementsRes,
-      outcomesRes,
-      certRes,
-      certDetailsRes,
-      scopeRes,
-      prevScoreRes,
-      communityFlagRes,
     ] = await Promise.allSettled([
 
-      // 1. Etherscan — recent 200 transactions (Pro allows higher offset)
+      // 1. Recent transactions — up to 200 with Pro
       fetch(
-        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=200&sort=desc&apikey=${ETHERSCAN_KEY}`
+        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=200&sort=desc&apikey=${ETHERSCAN_KEY}`,
+        { signal: AbortSignal.timeout(10000) }
       ).then(r => r.json()),
 
-      // 2. Etherscan — total transaction count via txlistinternal trick
+      // 2. First ever transaction — true wallet age
       fetch(
-        `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getTransactionCount&address=${wallet}&tag=latest&apikey=${ETHERSCAN_KEY}`
+        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey=${ETHERSCAN_KEY}`,
+        { signal: AbortSignal.timeout(10000) }
       ).then(r => r.json()),
 
-      // 3. Etherscan — ETH balance
+      // 3. ETH balance
       fetch(
-        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address=${wallet}&tag=latest&apikey=${ETHERSCAN_KEY}`
+        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address=${wallet}&tag=latest&apikey=${ETHERSCAN_KEY}`,
+        { signal: AbortSignal.timeout(8000) }
       ).then(r => r.json()),
 
-      // 4. Etherscan — FIRST ever transaction (sort=asc, offset=1) for true wallet age
+      // 4. Internal transactions — ERC-6551 TBA detection
       fetch(
-        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey=${ETHERSCAN_KEY}`
+        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlistinternal&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=50&sort=desc&apikey=${ETHERSCAN_KEY}`,
+        { signal: AbortSignal.timeout(8000) }
       ).then(r => r.json()),
 
-      // 5. Etherscan — internal transactions (ERC-6551 TBA detection + x402)
-      fetch(
-        `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlistinternal&address=${wallet}&startblock=0&endblock=99999999&page=1&offset=50&sort=desc&apikey=${ETHERSCAN_KEY}`
-      ).then(r => r.json()),
-
-      // 6. GetBlock — fraud check
+      // 5. GetBlock fraud check
       fetch(
         `https://hub-api.getblock.io/wallet-risk/fraudCheck`,
         {
-          method: "POST",
+          method:  "POST",
           headers: { "x-api-key": GETBLOCK_KEY, "Content-Type": "application/json" },
-          body: JSON.stringify({ address: wallet, network }),
+          body:    JSON.stringify({ address: wallet, network }),
+          signal:  AbortSignal.timeout(8000),
         }
       ).then(r => r.json()).catch(() => null),
 
-      // 7. Normies — ERC-8004 agent identity
-      fetch(`${NORMIES_API}/agents/info/${wallet}`).then(r => r.json()).catch(() => null),
-
-      // 8. OpenSea — agent binding check
+      // 6. Normies ERC-8004 agent identity
       fetch(
-        `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?limit=50`,
-        { headers: { "x-api-key": OPENSEA_KEY, "accept": "application/json" } }
+        `${NORMIES_API}/agents/info/${wallet}`,
+        { signal: AbortSignal.timeout(8000) }
       ).then(r => r.json()).catch(() => null),
 
-      // 9. Redis — endorsements
-      redis.get(`agentcheck:endorsements:${wallet}`).catch(() => null),
-
-      // 10. Redis — outcomes
-      redis.get(`agentcheck:outcomes:${wallet}`).catch(() => null),
-
-      // 11. Redis — certifications list
-      redis.get(`agentcheck:certs:${wallet}`).catch(() => null),
-
-      // 12. Redis — certification details (includes expiry)
-      redis.get(`agentcheck:cert_details:${wallet}`).catch(() => null),
-
-      // 13. Redis — permission scope
-      redis.get(`agentcheck:scope:${wallet}`).catch(() => null),
-
-      // 14. Redis — previous trust score
-      redis.get(`agentcheck:prev_trust:${wallet}`).catch(() => null),
-
-      // 15. Redis — community flag
-      redis.get(`agentcheck:flagged:${wallet}`).catch(() => null),
+      // 7. OpenSea agent binding
+      fetch(
+        `https://api.opensea.io/api/v2/chain/ethereum/account/${wallet}/nfts?limit=50`,
+        {
+          headers: { "x-api-key": OPENSEA_KEY, "accept": "application/json" },
+          signal:  AbortSignal.timeout(8000),
+        }
+      ).then(r => r.json()).catch(() => null),
     ]);
 
-    // ── PARSE ETHERSCAN ─────────────────────────────────────────────────────
+    // ── PARSE RESPONSES ────────────────────────────────────────────────────────
 
     const txData       = ethTxRes.status      === "fulfilled" ? ethTxRes.value      : null;
-    const txCountData  = ethTxCountRes.status === "fulfilled" ? ethTxCountRes.value : null;
-    const balData      = ethBalRes.status     === "fulfilled" ? ethBalRes.value     : null;
     const firstTxData  = ethFirstTxRes.status === "fulfilled" ? ethFirstTxRes.value : null;
+    const balData      = ethBalRes.status     === "fulfilled" ? ethBalRes.value     : null;
     const internalData = ethInternalRes.status === "fulfilled" ? ethInternalRes.value : null;
     const gbData       = getblockRes.status   === "fulfilled" ? getblockRes.value   : null;
     const nmData       = normiesAgentRes.status === "fulfilled" ? normiesAgentRes.value : null;
     const osData       = openSeaAgentRes.status === "fulfilled" ? openSeaAgentRes.value : null;
 
-    const endorsements  = endorsementsRes.status  === "fulfilled" ? endorsementsRes.value  : null;
-    const outcomes      = outcomesRes.status      === "fulfilled" ? outcomesRes.value      : null;
-    const certs         = certRes.status          === "fulfilled" ? certRes.value          : null;
-    const certDetails   = certDetailsRes.status   === "fulfilled" ? certDetailsRes.value   : null;
-    const scope         = scopeRes.status         === "fulfilled" ? scopeRes.value         : null;
-    const prevTrust     = prevScoreRes.status     === "fulfilled" ? prevScoreRes.value     : null;
-    const communityFlag = communityFlagRes.status === "fulfilled" ? communityFlagRes.value : null;
-
-    // Recent transactions (up to 200 with Pro)
+    // Transaction list
     const txList = txData?.result && Array.isArray(txData.result) ? txData.result : [];
 
-    // True total transaction count from eth_getTransactionCount
-    const trueTotalTx = txCountData?.result
-      ? parseInt(txCountData.result, 16)
-      : txList.length;
-
-    // ETH balance
-    const rawBalance = balData?.result && !isNaN(parseInt(balData.result))
-      ? parseInt(balData.result) : 0;
-    const ethBalance = (rawBalance / 1e18).toFixed(4);
-
-    // TRUE wallet age from first-ever transaction (separate API call)
-    const firstTxList  = firstTxData?.result && Array.isArray(firstTxData.result)
-      ? firstTxData.result : [];
+    // True wallet age
+    const firstTxList  = firstTxData?.result && Array.isArray(firstTxData.result) ? firstTxData.result : [];
     const firstTxEver  = firstTxList[0] || null;
     const trueFirstTs  = firstTxEver ? parseInt(firstTxEver.timeStamp) * 1000 : null;
-    const trueAgeDays  = trueFirstTs
-      ? Math.floor((Date.now() - trueFirstTs) / 86400000)
-      : 0;
-    const trueFirstSeen = trueFirstTs
-      ? new Date(trueFirstTs).toISOString().split("T")[0]
-      : null;
+    const trueAgeDays  = trueFirstTs ? Math.floor((Date.now() - trueFirstTs) / 86400000) : 0;
+    const trueFirstSeen = trueFirstTs ? new Date(trueFirstTs).toISOString().split("T")[0] : null;
 
-    // Last active from most recent transaction
+    // Last active
     const newestTx   = txList[0];
     const lastActive  = newestTx
       ? new Date(parseInt(newestTx.timeStamp) * 1000).toISOString().split("T")[0]
       : null;
 
-    // Success rate from recent transactions
-    const successTx   = txList.filter((t: any) => t.isError === "0").length;
-    const successRate  = txList.length > 0 ? successTx / txList.length : 0;
+    // True total tx count
+    const trueTotalTx = txList.length;
 
-    // Unique contracts (DeFi diversity)
+    // ETH balance
+    const rawBalance  = balData?.result && !isNaN(parseInt(balData.result))
+      ? parseInt(balData.result) : 0;
+    const ethBalance  = (rawBalance / 1e18).toFixed(4);
+
+    // Success rate
+    const successTx   = txList.filter((t: any) => t.isError === "0").length;
+    const successRate = txList.length > 0 ? successTx / txList.length : 0;
+
+    // Unique contracts
     const uniqueContracts = new Set(
       txList.filter((t: any) => t.to && t.input !== "0x").map((t: any) => t.to)
     ).size;
 
-    // ── ERC-6551 TBA DETECTION ──────────────────────────────────────────────
-
-    // Check if this wallet was created by the ERC-6551 registry
+    // ERC-6551 TBA detection
     const internalTxList = internalData?.result && Array.isArray(internalData.result)
       ? internalData.result : [];
-
     const hasTBA = internalTxList.some((t: any) =>
       t.from?.toLowerCase() === ERC6551_REGISTRY.toLowerCase() ||
       t.to?.toLowerCase()   === ERC6551_REGISTRY.toLowerCase()
     );
 
-    // ── x402 PAYMENT DETECTION ──────────────────────────────────────────────
-
-    const x402Payments = txList.filter((t: any) =>
-      X402_CONTRACTS.some(c => t.to?.toLowerCase() === c.toLowerCase())
-    ).length;
-
-    // Also check internal transactions for x402
-    const x402Internal = internalTxList.filter((t: any) =>
-      X402_CONTRACTS.some(c => t.to?.toLowerCase() === c.toLowerCase())
-    ).length;
-
-    const totalX402 = x402Payments + x402Internal;
-
-    // ── COUNTERPARTY RISK CHECK ─────────────────────────────────────────────
-
-    // Get unique counterparties from recent transactions
+    // Counterparties for relationship graph
     const counterparties = [...new Set(
       txList
-        .filter((t: any) => t.to && t.to !== wallet)
+        .filter((t: any) => t.to && t.to.toLowerCase() !== wallet)
         .map((t: any) => t.to.toLowerCase())
-    )].slice(0, 20);
+    )].slice(0, 20) as string[];
 
-    // Check how many counterparties are in our flagged list
-    let flaggedCounterparties = 0;
-    if (counterparties.length > 0) {
-      const flagChecks = await Promise.allSettled(
-        counterparties.map(cp =>
-          redis.get(`agentcheck:flagged:${cp}`).catch(() => null)
-        )
-      );
-      flaggedCounterparties = flagChecks.filter(
-        r => r.status === "fulfilled" && r.value !== null
-      ).length;
-    }
+    // ── ERC-8257 TOOL USAGE (Base) ─────────────────────────────────────────────
+    const erc8257Calls = await getErc8257Usage(wallet);
 
-    const counterpartyRiskScore = counterparties.length > 0
-      ? Math.round((flaggedCounterparties / counterparties.length) * 100)
-      : 0;
+    // ── WALLET RELATIONSHIP GRAPH ──────────────────────────────────────────────
+    const relationshipGraph = await getRelationshipGraph(wallet, counterparties);
 
-    // ── OPENSEA ERC-8004/8217 BINDING ──────────────────────────────────────
+    // ── COMMUNITY FLAGS ────────────────────────────────────────────────────────
+    const [
+      endorsementsData,
+      outcomesData,
+      certsData,
+      certDetailsData,
+      scopeData,
+      prevTrustData,
+      communityFlagData,
+    ] = await Promise.all([
+      redisGet(`agentcheck:endorsements:${wallet}`),
+      redisGet(`agentcheck:outcomes:${wallet}`),
+      redisGet(`agentcheck:certs:${wallet}`),
+      redisGet(`agentcheck:cert_details:${wallet}`),
+      redisGet(`agentcheck:scope:${wallet}`),
+      redisGet(`agentcheck:prev_trust:${wallet}`),
+      redisGet(`agentcheck:flagged:${wallet}`),
+    ]);
 
-    let hasAgentBinding   = false;
-    let agentCapabilities: string[] = [];
+    const endorseCount   = endorsementsData?.count    || 0;
+    const endorseList    = endorsementsData?.list      || [];
+    const outcomesPos    = outcomesData?.positive      || 0;
+    const outcomesTotal  = outcomesData?.total         || 0;
+    const certList       = certsData                   || [];
+    const scopeInfo      = scopeData                   || null;
+    const prevTrust      = prevTrustData ? parseInt(prevTrustData) : null;
+    const isCommunityFlagged = !!communityFlagData;
 
-    if (osData?.nfts && Array.isArray(osData.nfts)) {
-      const agentNFTs = osData.nfts.filter((nft: any) =>
-        nft.agent_binding ||
-        nft.metadata?.agent_metadata ||
-        nft.traits?.some((t: any) =>
-          ["agent","skill","capability","tool"].includes(
-            (t.trait_type || "").toLowerCase()
-          )
-        )
-      );
-      if (agentNFTs.length > 0) {
-        hasAgentBinding = true;
-        agentNFTs.forEach((nft: any) => {
-          (nft.traits || [])
-            .filter((t: any) => ["capability","skill","service","tool"].includes(
-              (t.trait_type || "").toLowerCase()
-            ))
-            .forEach((t: any) => { if (t.value) agentCapabilities.push(t.value); });
-        });
-        agentCapabilities = [...new Set(agentCapabilities)].slice(0, 10);
-      }
-    }
+    // Cert expiry
+    const certifiedAt    = certDetailsData?.certified_at || null;
+    const certExpired    = certifiedAt
+      ? (Date.now() - new Date(certifiedAt).getTime()) > 90 * 24 * 60 * 60 * 1000
+      : false;
+    const certExpiresAt  = certifiedAt
+      ? new Date(new Date(certifiedAt).getTime() + 90 * 24 * 60 * 60 * 1000).toISOString()
+      : null;
+    const batteryVersion = certDetailsData?.battery_version || null;
+    const batteryHash    = certDetailsData?.battery_hash    || null;
 
-    // ── GETBLOCK ───────────────────────────────────────────────────────────
-
+    // ── GETBLOCK ───────────────────────────────────────────────────────────────
     const gbRisk       = gbData?.risk_score            ?? null;
     const gbLevel      = gbData?.risk_level            ?? null;
     const gbFlags      = gbData?.flags                 ?? [];
@@ -488,49 +533,56 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const gbRugPull    = gbFlags.includes("rug_pull");
     const gbNewAddress = gbData?.is_new_address        ?? (trueAgeDays < 30);
 
-    // ── NORMIES / ERC-8004 ─────────────────────────────────────────────────
-
+    // ── NORMIES / ERC-8004 ─────────────────────────────────────────────────────
     const isErc8004  = !!(nmData && nmData.tokenId && !nmData.error);
     const agentName  = nmData?.name          || null;
     const agentType  = nmData?.type          || null;
     const agentLevel = nmData?.canvas?.level || null;
 
-    // ── REDIS ──────────────────────────────────────────────────────────────
+    // ── OPENSEA AGENT BINDING ──────────────────────────────────────────────────
+    let hasAgentBinding   = false;
+    let agentCapabilities: string[] = [];
 
-    const endorseCount   = endorsements ? (endorsements as any).count    || 0  : 0;
-    const endorseList    = endorsements ? (endorsements as any).list     || [] : [];
-    const outcomesPos    = outcomes     ? (outcomes as any).positive     || 0  : 0;
-    const outcomesTotal  = outcomes     ? (outcomes as any).total        || 0  : 0;
-    const certList       = certs        ? (certs as string[])                  : [];
-    const scopeData      = scope        ? (scope as any)                       : null;
-    const prevTrustScore = prevTrust    ? parseInt(prevTrust as string)        : null;
-    const isCommunityFlagged = !!communityFlag;
+    if (osData?.nfts && Array.isArray(osData.nfts)) {
+      const agentNFTs = osData.nfts.filter((nft: any) =>
+        nft.agent_binding ||
+        nft.metadata?.agent_metadata ||
+        nft.traits?.some((t: any) =>
+          ["agent","skill","capability","tool"].includes((t.trait_type || "").toLowerCase())
+        )
+      );
+      if (agentNFTs.length > 0) {
+        hasAgentBinding = true;
+        agentNFTs.forEach((nft: any) => {
+          (nft.traits || [])
+            .filter((t: any) => ["capability","skill","service","tool"].includes((t.trait_type || "").toLowerCase()))
+            .forEach((t: any) => { if (t.value) agentCapabilities.push(t.value); });
+        });
+        agentCapabilities = [...new Set(agentCapabilities)].slice(0, 10);
+      }
+    }
 
-    // Certification expiry check
-    const certDetailsObj  = certDetails ? (certDetails as any) : null;
-    const certifiedAt     = certDetailsObj?.certified_at || null;
-    const certExpired     = certifiedAt
-      ? (Date.now() - new Date(certifiedAt).getTime()) > 90 * 24 * 60 * 60 * 1000
-      : false;
-    const certExpiresAt   = certifiedAt
-      ? new Date(new Date(certifiedAt).getTime() + 90 * 24 * 60 * 60 * 1000).toISOString()
-      : null;
-    const certBatteryVersion = certDetailsObj?.battery_version || "1.0";
-
-    // ── COMPUTE SCORES ─────────────────────────────────────────────────────
+    // ── COMPUTE SCORES ─────────────────────────────────────────────────────────
 
     const { score: trustScore, breakdown: trustBreakdown } = computeTrustScore({
-      ageDays:          trueAgeDays,
-      totalTx:          trueTotalTx,
+      ageDays:              trueAgeDays,
+      totalTx:              trueTotalTx,
       successRate,
-      defiProtocols:    Math.min(uniqueContracts, 20),
-      paymentHistory:   0,
-      erc8257Usage:     0,
-      endorsements:     endorseCount,
-      outcomesPositive: outcomesPos,
+      defiProtocols:        Math.min(uniqueContracts, 20),
+      endorsements:         endorseCount,
+      outcomesPositive:     outcomesPos,
       outcomesTotal,
-      x402Payments:     totalX402,
+      erc8257Calls,
+      counterpartyAvgScore: relationshipGraph.avgScore,
     });
+
+    // Counterparty risk for risk score
+    const flaggedCounterparties = counterparties.filter(cp =>
+      relationshipGraph.details.some(d => d.wallet === cp && d.composite < 30)
+    ).length;
+    const counterpartyRiskScore = counterparties.length > 0
+      ? Math.round((flaggedCounterparties / counterparties.length) * 100)
+      : 0;
 
     const { score: riskScore, flags: riskFlags } = computeRiskScore({
       getblockRisk:     gbRisk,
@@ -552,15 +604,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       hasAgentBinding,
       agentCapabilities,
       hasTBA,
-      erc8257Calls:  0,
-      agentTxCount:  0,
+      erc8257Calls,
       certifications: certList,
       certExpired,
-      socialLinked:  false,
     });
 
     const rawComposite = compositeScore(trustScore, riskScore, agentScore);
-
     const hasRealHistory = trueAgeDays > 0 && trueTotalTx > 0;
     const hasSeriousFlag = gbSanctioned || gbMixer || gbDarkweb || gbPhishing || gbRugPull || isCommunityFlagged;
     const adjustedComposite = (hasRealHistory && !hasSeriousFlag)
@@ -569,27 +618,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const rating       = compositeToLetter(adjustedComposite);
     const verdict      = letterToVerdict(rating, isErc8004 || hasAgentBinding);
-    const scoreOutlook = outlookCalc(trustScore, prevTrustScore);
+    const scoreOutlook = outlookCalc(trustScore, prevTrust);
 
-    // ── HIGHLIGHTS ─────────────────────────────────────────────────────────
-
+    // ── HIGHLIGHTS ─────────────────────────────────────────────────────────────
     const highlights: string[] = [];
-    if (trueAgeDays > 0)              highlights.push(`Wallet active ${trueAgeDays} days since ${trueFirstSeen}`);
-    if (trueTotalTx > 0)              highlights.push(`${trueTotalTx} total transactions · ${Math.round(successRate * 100)}% success rate`);
-    if (parseFloat(ethBalance) > 0)   highlights.push(`Current balance: ${ethBalance} ETH`);
-    if (uniqueContracts > 0)          highlights.push(`${uniqueContracts} unique contracts interacted with`);
-    if (hasTBA)                       highlights.push("ERC-6551 Token Bound Account confirmed");
-    if (totalX402 > 0)                highlights.push(`${totalX402} x402 micropayments detected`);
-    if (endorseCount > 0)             highlights.push(`${endorseCount} community endorsements`);
-    if (outcomesTotal > 0)            highlights.push(`${outcomesPos}/${outcomesTotal} verified transactions positive`);
-    if (counterpartyRiskScore > 40)   highlights.push(`⚠ ${flaggedCounterparties}/${counterparties.length} recent counterparties flagged`);
-    if (isCommunityFlagged)           highlights.push("⚠ Community flagged as malicious");
+    if (trueAgeDays > 0)          highlights.push(`Wallet active ${trueAgeDays} days since ${trueFirstSeen}`);
+    if (trueTotalTx > 0)          highlights.push(`${trueTotalTx} transactions · ${Math.round(successRate * 100)}% success rate`);
+    if (parseFloat(ethBalance) > 0) highlights.push(`Balance: ${ethBalance} ETH`);
+    if (uniqueContracts > 0)      highlights.push(`${uniqueContracts} unique contracts`);
+    if (hasTBA)                   highlights.push("ERC-6551 Token Bound Account confirmed");
+    if (erc8257Calls > 0)         highlights.push(`${erc8257Calls} ERC-8257 registry interactions on Base`);
+    if (endorseCount > 0)         highlights.push(`${endorseCount} community endorsements`);
+    if (outcomesTotal > 0)        highlights.push(`${outcomesPos}/${outcomesTotal} outcomes positive`);
+    if (relationshipGraph.checkedCount > 0) {
+      highlights.push(
+        `Counterparty graph: ${relationshipGraph.trustedCount}/${relationshipGraph.checkedCount} trusted` +
+        (relationshipGraph.riskyCount > 0 ? `, ${relationshipGraph.riskyCount} risky` : "")
+      );
+    }
+    if (isCommunityFlagged) highlights.push("⚠ Community flagged as malicious");
     highlights.push(...agentHighlights);
 
-    // ── STORE ──────────────────────────────────────────────────────────────
-
+    // ── STORE IN REDIS ─────────────────────────────────────────────────────────
     const checkRecord = {
-      wallet, network,
+      wallet, network, source,
       trust_score:  trustScore,
       risk_score:   riskScore,
       agent_score:  agentScore,
@@ -598,18 +650,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ts:           Date.now(),
     };
 
-    Promise.all([
-      redis.lpush(`agentcheck:history:${wallet}`, JSON.stringify(checkRecord)),
-      redis.ltrim(`agentcheck:history:${wallet}`, 0, 99),
-      redis.set(`agentcheck:prev_trust:${wallet}`, trustScore.toString()),
-      redis.incr("agentcheck:total_checks"),
-    ]).catch(() => {});
+    await Promise.all([
+      redisPush(`agentcheck:history:${wallet}`, checkRecord),
+      redisSet(`agentcheck:prev_trust:${wallet}`, trustScore.toString()),
+      redisIncr("agentcheck:total_checks"),
+      // Track source
+      redisIncr(`agentcheck:calls:${source}`),
+    ]);
 
-    // ── RESPONSE ───────────────────────────────────────────────────────────
-
+    // ── RESPONSE ───────────────────────────────────────────────────────────────
     return res.status(200).json({
       wallet,
       network,
+      source,
       rating,
       outlook:    scoreOutlook,
       verdict,
@@ -630,29 +683,42 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           first_seen:         trueFirstSeen,
           last_active:        lastActive,
           total_transactions: trueTotalTx,
-          recent_sample:      txList.length,
           success_rate:       `${Math.round(successRate * 100)}%`,
           eth_balance:        `${ethBalance} ETH`,
           unique_contracts:   uniqueContracts,
-          x402_payments:      totalX402,
           tba_wallet:         hasTBA,
-          data_source:        "Etherscan v2",
+          data_source:        "Etherscan v2 Pro",
         },
 
-        counterparty_analysis: {
-          counterparties_checked:  counterparties.length,
-          flagged_counterparties:  flaggedCounterparties,
-          counterparty_risk_score: counterpartyRiskScore,
-          note: flaggedCounterparties > 0
-            ? `${flaggedCounterparties} of your recent counterparties have been flagged by the community`
-            : "No flagged counterparties detected",
+        erc8257_activity: {
+          registry_calls:   erc8257Calls,
+          registry_address: ERC8257_REGISTRY,
+          network:          "Base",
+          note: erc8257Calls > 0
+            ? `${erc8257Calls} verified interactions with ERC-8257 registry on Base`
+            : "No ERC-8257 registry interactions detected on Base",
+        },
+
+        relationship_graph: {
+          counterparties_analysed: relationshipGraph.checkedCount,
+          average_counterparty_score: relationshipGraph.avgScore,
+          trusted_counterparties: relationshipGraph.trustedCount,
+          risky_counterparties:   relationshipGraph.riskyCount,
+          top_counterparties:     relationshipGraph.details,
+          interpretation: relationshipGraph.avgScore >= 60
+            ? "Wallet transacts primarily with trusted counterparties"
+            : relationshipGraph.avgScore >= 40
+            ? "Mixed counterparty quality — some risky interactions"
+            : relationshipGraph.checkedCount > 0
+            ? "High-risk counterparty network detected"
+            : "Insufficient counterparty data",
         },
 
         forensics: {
-          provider:   "GetBlock Fraud Check",
-          risk_level: gbLevel || (riskScore < 30 ? "LOW" : riskScore < 60 ? "MEDIUM" : "HIGH"),
-          flags:      riskFlags,
-          sanctioned: gbSanctioned,
+          provider:         "GetBlock Fraud Check",
+          risk_level:       gbLevel || (riskScore < 30 ? "LOW" : riskScore < 60 ? "MEDIUM" : "HIGH"),
+          flags:            riskFlags,
+          sanctioned:       gbSanctioned,
           community_flagged: isCommunityFlagged,
         },
 
@@ -665,9 +731,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           type:               agentType,
           level:              agentLevel,
           capabilities:       agentCapabilities,
-          note: !isErc8004 && !hasAgentBinding
-            ? "Not a registered ERC-8004 agent"
-            : "Registered agent with on-chain identity",
         },
 
         certifications: {
@@ -675,8 +738,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           expired:          certExpired,
           certified_at:     certifiedAt,
           expires_at:       certExpiresAt,
-          battery_version:  certBatteryVersion,
-          pending:          ["prompt_injection", "secret_protection", "unsafe_action_gating"]
+          battery_version:  batteryVersion,
+          battery_hash:     batteryHash,
+          pending:          ["prompt_injection", "secret_protection", "unsafe_action"]
             .filter(c => !certList.includes(c)),
           note: certList.length === 0
             ? "No safety certifications. Submit via POST /api/certify."
@@ -692,16 +756,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           positive_outcomes: outcomesPos,
         },
 
-        permission_scope: scopeData || {
+        permission_scope: scopeInfo || {
           declared: false,
           note:     "No permission scope declared. Submit via POST /api/scope.",
         },
 
+        data_freshness: {
+          checked_at:   new Date().toISOString(),
+          age_seconds:  0,
+          sources: {
+            etherscan:  "live — latest block state",
+            getblock:   "live — real-time forensics",
+            opensea:    "live — real-time agent binding",
+            redis:      "live — exact moment of call",
+            base_rpc:   "live — ERC-8257 activity",
+          },
+          recommended_ttl: {
+            low_value_decisions:  "300 seconds",
+            high_value_decisions: "30 seconds — re-check before executing",
+            atomic_enforcement:   "use isCertified() on-chain directly",
+          },
+          cert_registry: "0x803A8988E40CBb54897e5782A6A589d907A5B03A",
+          staleness_note: "Composite score is point-in-time. For atomic enforcement use isCertified() directly.",
+        },
+
         how_to_improve: {
           automatic: [
-            "Wallet age increases naturally over time",
-            "Each successful transaction adds to volume score",
-            "Interacting with more protocols increases diversity score",
+            "Wallet age increases naturally",
+            "Each successful transaction adds volume score",
+            "Transacting with trusted counterparties improves relationship graph",
+            "Using ERC-8257 tools on Base adds tool usage score",
           ],
           actions: [
             "Get endorsed: POST /api/endorse",
@@ -714,27 +798,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
       },
 
-data_freshness: {
-  checked_at:   new Date().toISOString(),
-  age_seconds:  0,
-  sources: {
-    etherscan: "live — latest block state at time of call",
-    getblock:  "live — real-time forensic screening",
-    opensea:   "live — real-time agent binding check",
-    redis:     "live — exact moment of call",
-  },
-  recommended_ttl: {
-    low_value_decisions:  "300 seconds (5 minutes)",
-    high_value_decisions: "30 seconds — re-check before executing",
-    atomic_enforcement:   "use isCertified(address) on-chain directly — no TTL concern",
-  },
-  staleness_note: "Composite score is a point-in-time snapshot. The gap between check and execution is a known limitation. For atomic on-chain enforcement use isCertified() on the cert registry directly.",
-  cert_registry: "0x803A8988E40CBb54897e5782A6A589d907A5B03A",
-},
-      
       human_report: `https://agentcheck-bice.vercel.app/api/report?wallet=${wallet}`,
       methodology:  "https://agentcheck-bice.vercel.app/api/methodology",
-      powered_by:   ["Etherscan v2", "GetBlock Fraud Check", "Normies ERC-8004 Registry", "OpenSea Agent API", "AgentCheck Community"],
+      powered_by:   [
+        "Etherscan v2 Pro",
+        "GetBlock Fraud Check",
+        "Normies ERC-8004 Registry",
+        "OpenSea Agent API",
+        "AgentCheck Community",
+        "Base RPC (ERC-8257 activity)",
+      ],
     });
 
   } catch (err: any) {
