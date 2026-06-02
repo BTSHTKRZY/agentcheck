@@ -49,10 +49,7 @@ const MANIFEST = {
     "erc-8257"
   ],
   version: "1.1.0",
-  pricing: {
-    model: "free",
-    details: "Open access. No API key required."
-  },
+  pricing: [],
   chains: ["ethereum", "base"],
   display: {
     name: "AgentCheck",
