@@ -37,7 +37,30 @@ const MANIFEST = {
       report:      { type: "object", description: "Full rating report" },
     },
   },
-  creatorAddress: "0x020d6409ebc4fa13e754e0fea275ac353efd4f03",
+  category: "trust-and-reputation",
+  tags: [
+    "trust",
+    "reputation", 
+    "wallet-rating",
+    "agent-safety",
+    "certification",
+    "forensics",
+    "erc-8004",
+    "erc-8257"
+  ],
+  version: "1.1.0",
+  pricing: {
+    model: "free",
+    details: "Open access. No API key required."
+  },
+  chains: ["ethereum", "base"],
+  display: {
+    name: "AgentCheck",
+    tagline: "Trust ratings for the agent economy",
+    url: "https://agentcheck-bice.vercel.app",
+    methodology: "https://agentcheck-bice.vercel.app/api/methodology",
+  },
+    creatorAddress: "0x020d6409ebc4fa13e754e0fea275ac353efd4f03",
 };
 
 export default function handler(req: VercelRequest, res: VercelResponse) {
