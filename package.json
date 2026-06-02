@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "dependencies": {
     "@upstash/redis": "latest",
-    "@vercel/node": "latest"
+    "@vercel/node": "latest",
+    "viem": "latest"
   }
 }
