@@ -1,10 +1,67 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { Redis } from "@upstash/redis";
+import {
+  sanitizeWallet, sanitizeText, sanitizeNetwork, verifySignature,
+  buildActionMessage, isTimestampFresh, checkRateLimit, getClientIdentifier,
+} from "../lib/verify.js";
 
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL!,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-});
+const REDIS_URL     = process.env.UPSTASH_REDIS_REST_URL!;
+const REDIS_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN!;
+const ETHERSCAN_KEY = process.env.ETHERSCAN_API_KEY || "";
+
+const CHAIN_IDS: Record<string, number> = {
+  eth: 1, base: 8453, polygon: 137, bsc: 56, arbitrum: 42161,
+};
+
+async function redisGet(key: string): Promise<any> {
+  try {
+    const r = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+    const d = await r.json() as any;
+    return d?.result ? JSON.parse(d.result) : null;
+  } catch { return null; }
+}
+
+async function redisSet(key: string, value: any): Promise<void> {
+  try {
+    await fetch(`${REDIS_URL}/set/${encodeURIComponent(key)}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(value),
+    });
+  } catch {}
+}
+
+// Verify the tx_hash exists on-chain AND involves both reporter and counterparty
+async function verifyTransaction(
+  txHash: string,
+  reporter: string,
+  counterparty: string,
+  network: string
+): Promise<boolean> {
+  try {
+    if (!/^0x[a-f0-9]{64}$/.test(txHash.toLowerCase())) return false;
+    const chainId = CHAIN_IDS[network] || 1;
+
+    const r = await fetch(
+      `https://api.etherscan.io/v2/api?chainid=${chainId}&module=proxy&action=eth_getTransactionByHash&txhash=${txHash}&apikey=${ETHERSCAN_KEY}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    const d  = await r.json() as any;
+    const tx = d?.result;
+    if (!tx) return false;
+
+    const from = (tx.from || "").toLowerCase();
+    const to   = (tx.to   || "").toLowerCase();
+    const rep  = reporter.toLowerCase();
+    const cp   = counterparty.toLowerCase();
+
+    // The transaction must involve both parties
+    return (from === rep && to === cp) || (from === cp && to === rep);
+  } catch {
+    return false;
+  }
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -13,84 +70,103 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
-  const {
-    wallet,
-    reporter,
-    outcome,
-    tx_hash,
-    value_eth,
-    context,
-  } = req.body;
-
-  if (!wallet || !reporter || !outcome) {
-    return res.status(400).json({
-      error: "wallet, reporter, and outcome required. outcome must be: positive, negative, or neutral",
-    });
+  // Rate limit — 30 outcomes per hour per IP
+  const clientId = getClientIdentifier(req);
+  const allowed  = await checkRateLimit(`outcome:${clientId}`, 30, 3600);
+  if (!allowed) {
+    return res.status(429).json({ error: "Rate limit exceeded. Max 30 outcome reports per hour." });
   }
 
-  if (!["positive", "negative", "neutral"].includes(outcome)) {
-    return res.status(400).json({
-      error: "outcome must be: positive, negative, or neutral",
-    });
+  const reporter  = sanitizeWallet(req.body?.reporter);
+  const target    = sanitizeWallet(req.body?.wallet);
+  const outcome   = sanitizeText(req.body?.outcome, 20);
+  const context   = sanitizeText(req.body?.context, 200);
+  const txHash    = sanitizeText(req.body?.tx_hash, 66);
+  const network   = sanitizeNetwork(req.body?.network);
+  const signature = req.body?.signature;
+  const timestamp = req.body?.timestamp;
+
+  if (!reporter || !target) {
+    return res.status(400).json({ error: "Valid reporter and wallet addresses required." });
+  }
+  if (reporter === target) {
+    return res.status(400).json({ error: "Cannot report outcome on your own wallet." });
   }
 
-  try {
-    const key = `agentcheck:outcomes:${wallet.toLowerCase()}`;
-    const existing: any = await redis.get(key).catch(() => null);
+  const validOutcome = ["positive", "negative", "neutral"].includes(outcome);
+  if (!validOutcome) {
+    return res.status(400).json({ error: "Outcome must be positive, negative, or neutral." });
+  }
 
-    const current = existing || { total: 0, positive: 0, negative: 0, neutral: 0, records: [] };
-
-    // Add outcome record
-    current.total    += 1;
-    current[outcome] += 1;
-    current.records.push({
-      reporter:  reporter.toLowerCase(),
-      outcome,
-      tx_hash:   tx_hash   || null,
-      value_eth: value_eth || null,
-      context:   context   || null,
-      ts:        Date.now(),
+  // CRITICAL: Signature verification
+  if (!signature || !timestamp) {
+    return res.status(401).json({
+      error: "Signature required.",
+      instructions: {
+        message_to_sign: buildActionMessage("outcome", reporter, target, Date.now()),
+        note: "Sign with reporter wallet, resubmit with 'signature' and 'timestamp'.",
+      },
     });
+  }
+  if (!isTimestampFresh(timestamp)) {
+    return res.status(401).json({ error: "Timestamp expired. Signatures valid for 10 minutes." });
+  }
+  const expectedMessage = buildActionMessage("outcome", reporter, target, timestamp);
+  const validSig = await verifySignature(expectedMessage, signature, reporter);
+  if (!validSig) {
+    return res.status(401).json({ error: "Invalid signature." });
+  }
 
-    // Keep last 200 records
-    if (current.records.length > 200) {
-      current.records = current.records.slice(-200);
+  // CRITICAL: Verify the transaction actually happened between these parties
+  // This prevents outcome farming with fabricated tx hashes
+  let txVerified = false;
+  if (txHash) {
+    txVerified = await verifyTransaction(txHash, reporter, target, network);
+    if (!txVerified) {
+      return res.status(400).json({
+        error: "Transaction verification failed. The tx_hash must exist on-chain and involve both reporter and target wallets.",
+      });
     }
-
-    await redis.set(key, current);
-
-    // Global outcome feed — powers model calibration over time
-    await redis.lpush("agentcheck:outcome_feed", JSON.stringify({
-      wallet:    wallet.toLowerCase(),
-      reporter:  reporter.toLowerCase(),
-      outcome,
-      tx_hash:   tx_hash   || null,
-      value_eth: value_eth || null,
-      ts:        Date.now(),
-    }));
-    await redis.ltrim("agentcheck:outcome_feed", 0, 9999);
-
-    // Increment global counters
-    await redis.incr(`agentcheck:outcomes_total`);
-    await redis.incr(`agentcheck:outcomes_${outcome}`);
-
-    const positiveRate = current.total > 0
-      ? Math.round((current.positive / current.total) * 100)
-      : 0;
-
-    return res.status(200).json({
-      ok: true,
-      wallet:         wallet.toLowerCase(),
-      outcome_recorded: outcome,
-      total_outcomes: current.total,
-      positive:       current.positive,
-      negative:       current.negative,
-      neutral:        current.neutral,
-      positive_rate:  `${positiveRate}%`,
-      message:        `Outcome recorded. This data improves AgentCheck scoring accuracy over time.`,
+  } else {
+    // Outcome without tx_hash is allowed but marked unverified and weighted to zero
+    return res.status(400).json({
+      error: "tx_hash required. Outcomes must reference a verifiable on-chain transaction between the two wallets.",
     });
-
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
   }
+
+  const key      = `agentcheck:outcomes:${target}`;
+  const existing = await redisGet(key) || {
+    positive: 0, negative: 0, neutral: 0, total: 0, list: [],
+  };
+
+  // Prevent duplicate outcome for same tx_hash
+  if (existing.list.some((o: any) => o.tx_hash === txHash)) {
+    return res.status(409).json({ error: "An outcome has already been reported for this transaction." });
+  }
+
+  existing[outcome] += 1;
+  existing.total    += 1;
+  existing.list.push({
+    reporter, outcome, context, tx_hash: txHash,
+    verified: txVerified, ts: Date.now(),
+  });
+  if (existing.list.length > 100) existing.list = existing.list.slice(-100);
+
+  await redisSet(key, existing);
+
+  return res.status(200).json({
+    ok: true,
+    message: `Verified outcome recorded for ${target}`,
+    outcome: {
+      reporter, target, outcome,
+      tx_verified: txVerified,
+      totals: {
+        positive: existing.positive,
+        negative: existing.negative,
+        neutral:  existing.neutral,
+        total:    existing.total,
+      },
+    },
+    note: "Outcome verified against on-chain transaction. This carries full weight in the trust score.",
+  });
 }
