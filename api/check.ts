@@ -633,12 +633,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       counterpartyAvgScore: relationshipGraph.avgScore,
     });
 
-    // Counterparty risk for risk score
-    const flaggedCounterparties = counterparties.filter(cp =>
+    // Counterparty risk for risk score — based on EOA peers only.
+    // Protocol/contract interactions are excluded (they are not risk signals).
+    const flaggedCounterparties = eoaCounterparties.filter(cp =>
       relationshipGraph.details.some(d => d.wallet === cp && d.composite < 30)
     ).length;
-    const counterpartyRiskScore = counterparties.length > 0
-      ? Math.round((flaggedCounterparties / counterparties.length) * 100)
+    const counterpartyRiskScore = eoaCounterparties.length > 0
+      ? Math.round((flaggedCounterparties / eoaCounterparties.length) * 100)
       : 0;
 
     const { score: riskScore, flags: riskFlags } = computeRiskScore({
