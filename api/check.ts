@@ -3,6 +3,7 @@ import {
   sanitizeWallet, sanitizeNetwork, sanitizeSource,
   checkRateLimit, getClientIdentifier,
 } from "../lib/verify.js";
+import { getLabel, isKnownContract, KnownAddress } from "../lib/knownAddresses.js";
 
 const ETHERSCAN_KEY    = process.env.ETHERSCAN_API_KEY    || "";
 const GETBLOCK_KEY     = process.env.GETBLOCK_API_KEY     || "";
@@ -250,6 +251,32 @@ function compositeScore(trust: number, risk: number, agent: number): number {
 
 // ── ERC-8257 TOOL USAGE (Base network) ───────────────────────────────────────
 
+// Detect whether an address is a contract (has code) vs an EOA.
+// One eth_getCode call on mainnet. Returns true if contract.
+async function isContractAddress(wallet: string, chainId: number = 1): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `https://api.etherscan.io/v2/api?chainid=${chainId}&module=proxy&action=eth_getCode&address=${wallet}&tag=latest&apikey=${ETHERSCAN_KEY}`,
+      { signal: AbortSignal.timeout(6000) }
+    );
+    const data = await res.json() as any;
+    const code = data?.result || "0x";
+    return code !== "0x" && code.length > 2;
+  } catch {
+    return false;
+  }
+}
+
+// Increment the rating distribution counter (fire-and-forget).
+async function incrRatingCounter(rating: string): Promise<void> {
+  try {
+    await fetch(`${REDIS_URL}/incr/${encodeURIComponent("agentcheck:rating:" + rating)}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+  } catch {}
+}
+
 async function getErc8257Usage(wallet: string): Promise<number> {
   try {
     // Check Base network for transactions to the ERC-8257 registry
@@ -283,6 +310,7 @@ async function getRelationshipGraph(
   riskyCount:      number;
   details:         Array<{ wallet: string; rating: string; composite: number }>;
 }> {
+  // counterparties here are already filtered to likely-EOA peers.
   if (counterparties.length === 0) {
     return { avgScore: 0, checkedCount: 0, trustedCount: 0, riskyCount: 0, details: [] };
   }
@@ -478,18 +506,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       t.to?.toLowerCase()   === ERC6551_REGISTRY.toLowerCase()
     );
 
-    // Counterparties for relationship graph
-    const counterparties = [...new Set(
-      txList
-        .filter((t: any) => t.to && t.to.toLowerCase() !== wallet)
+    // Split counterparties into EOA peers vs protocol/contract interactions.
+    // Peer transfers have empty input ("0x"); contract calls carry calldata.
+    // Known protocol/token addresses are always treated as contracts.
+    const allTo = txList.filter((t: any) => t.to && t.to.toLowerCase() !== wallet);
+
+    const protocolInteractions = [...new Set(
+      allTo
+        .filter((t: any) => t.input !== "0x" || isKnownContract(t.to))
+        .map((t: any) => t.to.toLowerCase())
+    )] as string[];
+
+    const eoaCounterparties = [...new Set(
+      allTo
+        .filter((t: any) => t.input === "0x" && !isKnownContract(t.to))
         .map((t: any) => t.to.toLowerCase())
     )].slice(0, 20) as string[];
+
+    // Label any protocol interactions we recognise (for the report).
+    const labelledProtocols = protocolInteractions
+      .map((a) => { const l = getLabel(a); return l ? { address: a, ...l } : null; })
+      .filter(Boolean)
+      .slice(0, 10);
+
+    // ── CONTRACT DETECTION (checked address) ───────────────────────────────────
+    const knownLabel    = getLabel(wallet);
+    const chainId       = network === "base" ? 8453 : network === "polygon" ? 137 : network === "bsc" ? 56 : network === "arbitrum" ? 42161 : 1;
+    const addressIsContract = knownLabel ? true : await isContractAddress(wallet, chainId);
 
     // ── ERC-8257 TOOL USAGE (Base) ─────────────────────────────────────────────
     const erc8257Calls = await getErc8257Usage(wallet);
 
-    // ── WALLET RELATIONSHIP GRAPH ──────────────────────────────────────────────
-    const relationshipGraph = await getRelationshipGraph(wallet, counterparties);
+    // ── WALLET RELATIONSHIP GRAPH (EOA peers only) ─────────────────────────────
+    const relationshipGraph = await getRelationshipGraph(wallet, eoaCounterparties);
 
     // ── COMMUNITY FLAGS ────────────────────────────────────────────────────────
     const [
@@ -625,13 +674,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       : rawComposite;
 
     const rating       = compositeToLetter(adjustedComposite);
-    const verdict      = letterToVerdict(rating, isErc8004 || hasAgentBinding);
+    // Contract-aware verdict: a labelled/verified contract is infrastructure,
+    // not a personal wallet to "trust with funds" in the same sense.
+    let verdict = letterToVerdict(rating, isErc8004 || hasAgentBinding);
+    if (knownLabel) {
+      verdict = `Known ${knownLabel.type}: ${knownLabel.label}. ` +
+        (knownLabel.verified
+          ? "Recognised, verified address. Treat as infrastructure, not a peer wallet."
+          : "Recognised address. Verify intent before transacting.");
+    } else if (addressIsContract) {
+      verdict = `This address is a smart contract, not an EOA wallet. ` +
+        `Wallet-history trust signals apply differently — evaluate the contract's ` +
+        `verification, usage, and audit status rather than 'who it transacts with'.`;
+    }
     const scoreOutlook = outlookCalc(trustScore, prevTrust);
 
     // ── HIGHLIGHTS ─────────────────────────────────────────────────────────────
     const highlights: string[] = [];
-    if (trueAgeDays > 0)          highlights.push(`Wallet active ${trueAgeDays} days since ${trueFirstSeen}`);
+    if (knownLabel)               highlights.push(`✓ Identified: ${knownLabel.label} (${knownLabel.type}${knownLabel.verified ? ", verified" : ""})`);
+    else if (addressIsContract)   highlights.push("◆ This address is a smart contract, not an EOA wallet");
+    if (trueAgeDays > 0)          highlights.push(`${addressIsContract ? "Contract" : "Wallet"} active ${trueAgeDays} days since ${trueFirstSeen}`);
     if (trueTotalTx > 0)          highlights.push(`${trueTotalTx} transactions · ${Math.round(successRate * 100)}% success rate`);
+    if (labelledProtocols.length > 0) highlights.push(`Interacts with ${labelledProtocols.length} known protocol${labelledProtocols.length > 1 ? "s" : ""}: ${labelledProtocols.map((p: any) => p.label).slice(0, 3).join(", ")}`);
     if (parseFloat(ethBalance) > 0) highlights.push(`Balance: ${ethBalance} ETH`);
     if (uniqueContracts > 0)      highlights.push(`${uniqueContracts} unique contracts`);
     if (hasTBA)                   highlights.push("ERC-6551 Token Bound Account confirmed");
@@ -640,7 +704,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (outcomesTotal > 0)        highlights.push(`${outcomesPos}/${outcomesTotal} outcomes positive`);
     if (relationshipGraph.checkedCount > 0) {
       highlights.push(
-        `Counterparty graph: ${relationshipGraph.trustedCount}/${relationshipGraph.checkedCount} trusted` +
+        `EOA peer graph: ${relationshipGraph.trustedCount}/${relationshipGraph.checkedCount} trusted` +
         (relationshipGraph.riskyCount > 0 ? `, ${relationshipGraph.riskyCount} risky` : "")
       );
     }
@@ -664,6 +728,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       redisIncr("agentcheck:total_checks"),
       // Track source
       redisIncr(`agentcheck:calls:${source}`),
+      // Rating distribution counter (for /api/stats)
+      incrRatingCounter(rating),
     ]);
 
     // ── RESPONSE ───────────────────────────────────────────────────────────────
@@ -676,6 +742,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       verdict,
       checked_at: new Date().toISOString(),
 
+      address_type: {
+        is_contract: addressIsContract,
+        is_eoa:      !addressIsContract,
+        known:       !!knownLabel,
+        label:       knownLabel ? knownLabel.label : null,
+        category:    knownLabel ? knownLabel.type : (addressIsContract ? "unlabelled-contract" : "eoa"),
+        verified:    knownLabel ? knownLabel.verified : false,
+      },
+
       trust_score: trustScore,
       risk_score:  riskScore,
       agent_score: agentScore,
@@ -687,6 +762,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         trust_breakdown: trustBreakdown,
 
         wallet_data: {
+          address_type:       addressIsContract ? "contract" : "eoa",
+          identified_as:      knownLabel ? knownLabel.label : null,
           age_days:           trueAgeDays,
           first_seen:         trueFirstSeen,
           last_active:        lastActive,
@@ -696,6 +773,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           unique_contracts:   uniqueContracts,
           tba_wallet:         hasTBA,
           data_source:        "Etherscan v2 Pro",
+        },
+
+        protocol_interactions: {
+          count:      labelledProtocols.length,
+          recognised: labelledProtocols,
+          note: labelledProtocols.length > 0
+            ? "Known protocol/token contracts this address has interacted with. These are excluded from the EOA peer trust graph."
+            : "No recognised protocol interactions among recent transactions.",
         },
 
         erc8257_activity: {
@@ -708,18 +793,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
 
         relationship_graph: {
-          counterparties_analysed: relationshipGraph.checkedCount,
+          scope: "EOA peers only — protocol/contract interactions excluded",
+          eoa_counterparties_analysed: relationshipGraph.checkedCount,
           average_counterparty_score: relationshipGraph.avgScore,
           trusted_counterparties: relationshipGraph.trustedCount,
           risky_counterparties:   relationshipGraph.riskyCount,
           top_counterparties:     relationshipGraph.details,
-          interpretation: relationshipGraph.avgScore >= 60
-            ? "Wallet transacts primarily with trusted counterparties"
+          interpretation: relationshipGraph.checkedCount === 0
+            ? "No peer-to-peer EOA counterparties found — this address interacts mainly with contracts/protocols, which is normal for active DeFi users and contracts. Not a negative signal."
+            : relationshipGraph.avgScore >= 60
+            ? "Transacts primarily with trusted EOA peers"
             : relationshipGraph.avgScore >= 40
-            ? "Mixed counterparty quality — some risky interactions"
-            : relationshipGraph.checkedCount > 0
-            ? "High-risk counterparty network detected"
-            : "Insufficient counterparty data",
+            ? "Mixed EOA peer quality — some risky peers"
+            : "High-risk EOA peer network detected",
         },
 
         forensics: {
