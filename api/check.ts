@@ -12,6 +12,9 @@ const NORMIES_API      = "https://api.normies.art";
 const NORMIES_CONTRACT = "0x9Eb6E2025B64f340691e424b7fe7022fFDE12438";
 const ERC6551_REGISTRY = "0x000000006551c19487814612e58FE06813775758";
 const ERC8257_REGISTRY = "0x265BB2DBFC0A8165C9A1941Eb1372F349baD2cf1";
+// USDC contracts — the rail x402 micropayments settle on
+const USDC_ETH  = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+const USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const BASE_RPC         = "https://mainnet.base.org";
 const REDIS_URL        = process.env.UPSTASH_REDIS_REST_URL!;
 const REDIS_TOKEN      = process.env.UPSTASH_REDIS_REST_TOKEN!;
@@ -107,8 +110,9 @@ function computeTrustScore(data: {
   endorsements:       number;
   outcomesPositive:   number;
   outcomesTotal:      number;
-  erc8257Calls:       number;   // NEW — ERC-8257 tool usage
-  counterpartyAvgScore: number; // NEW — wallet relationship graph
+  erc8257Calls:       number;
+  counterpartyAvgScore: number;
+  x402Payments:       number;   // NEW — stablecoin payment activity (x402 rail)
 }): { score: number; breakdown: Record<string, number> } {
 
   const ageScore =
@@ -128,24 +132,33 @@ function computeTrustScore(data: {
     data.successRate >= 0.90 ? 10 :
     data.successRate >= 0.80 ? 5  : 0;
 
-  const defiScore    = Math.min(10, data.defiProtocols * 2);
-  const endorseScore = Math.min(10, data.endorsements * 3);
+  const defiScore    = Math.min(8, data.defiProtocols * 2);
+  const endorseScore = Math.min(8, data.endorsements * 3);
   const outcomeScore = data.outcomesTotal > 0
     ? Math.round((data.outcomesPositive / data.outcomesTotal) * 5)
     : 0;
 
-  // ERC-8257 tool usage — max 10 pts
-  const toolScore = Math.min(10, data.erc8257Calls * 2);
+  // ERC-8257 tool usage — max 8 pts
+  const toolScore = Math.min(8, data.erc8257Calls * 2);
 
-  // Wallet relationship graph — max 10 pts
-  // Average score of counterparties maps to trust signal
+  // Wallet relationship graph — max 8 pts
   const relationshipScore = data.counterpartyAvgScore > 0
-    ? Math.round((data.counterpartyAvgScore / 100) * 10)
+    ? Math.round((data.counterpartyAvgScore / 100) * 8)
     : 0;
+
+  // x402 / stablecoin payment activity — max 10 pts
+  // An agent that pays for services on the x402 rail is demonstrably
+  // funded, active, and economically real. Harder to fake than tx count.
+  const x402Score =
+    data.x402Payments >= 50 ? 10 :
+    data.x402Payments >= 20 ? 8  :
+    data.x402Payments >= 10 ? 6  :
+    data.x402Payments >= 5  ? 4  :
+    data.x402Payments >= 1  ? 2  : 0;
 
   const score =
     ageScore + txScore + successScore + defiScore +
-    endorseScore + outcomeScore + toolScore + relationshipScore;
+    endorseScore + outcomeScore + toolScore + relationshipScore + x402Score;
 
   return {
     score: Math.min(100, score),
@@ -158,6 +171,7 @@ function computeTrustScore(data: {
       outcome_accuracy:     outcomeScore,
       erc8257_tool_usage:   toolScore,
       relationship_graph:   relationshipScore,
+      x402_payment_activity: x402Score,
     },
   };
 }
@@ -275,6 +289,67 @@ async function incrRatingCounter(rating: string): Promise<void> {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
     });
   } catch {}
+}
+
+// Push a timestamped composite score onto the wallet's history list (capped).
+async function pushScoreHistory(wallet: string, composite: number, rating: string): Promise<void> {
+  try {
+    const entry = JSON.stringify({ c: composite, r: rating, t: Date.now() });
+    await fetch(`${REDIS_URL}/lpush/${encodeURIComponent("agentcheck:score_history:" + wallet)}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+    });
+    // Trim to last 30 points
+    await fetch(`${REDIS_URL}/ltrim/${encodeURIComponent("agentcheck:score_history:" + wallet)}/0/29`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+  } catch {}
+}
+
+// Read the wallet's score history (most-recent first).
+async function getScoreHistory(wallet: string): Promise<Array<{ c: number; r: string; t: number }>> {
+  try {
+    const res = await fetch(`${REDIS_URL}/lrange/${encodeURIComponent("agentcheck:score_history:" + wallet)}/0/29`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+    const data = await res.json() as any;
+    const arr  = Array.isArray(data?.result) ? data.result : [];
+    return arr.map((s: string) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// Detect stablecoin payment activity on the x402 rail.
+// x402 micropayments settle as USDC transfers. We count OUTGOING USDC
+// transfers (wallet is sender) across ETH + Base as a proxy for an agent
+// that pays for services. Not every USDC transfer is x402, so this is
+// framed as "payment activity" — directionally strong, not definitional.
+async function getX402PaymentActivity(wallet: string): Promise<{
+  count: number; chains: string[];
+}> {
+  const chains: string[] = [];
+  let total = 0;
+  const queries = [
+    { chainId: 1,    usdc: USDC_ETH,  name: "ethereum" },
+    { chainId: 8453, usdc: USDC_BASE, name: "base" },
+  ];
+  for (const q of queries) {
+    try {
+      const res = await fetch(
+        `https://api.etherscan.io/v2/api?chainid=${q.chainId}&module=account&action=tokentx&contractaddress=${q.usdc}&address=${wallet}&page=1&offset=100&sort=desc&apikey=${ETHERSCAN_KEY}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      const data = await res.json() as any;
+      const txs  = Array.isArray(data?.result) ? data.result : [];
+      // Outgoing only — the wallet is paying
+      const outgoing = txs.filter((t: any) => (t.from || "").toLowerCase() === wallet).length;
+      if (outgoing > 0) { total += outgoing; chains.push(q.name); }
+    } catch {}
+  }
+  return { count: total, chains };
 }
 
 async function getErc8257Usage(wallet: string): Promise<number> {
@@ -537,6 +612,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // ── ERC-8257 TOOL USAGE (Base) ─────────────────────────────────────────────
     const erc8257Calls = await getErc8257Usage(wallet);
 
+    // ── x402 / STABLECOIN PAYMENT ACTIVITY ─────────────────────────────────────
+    const x402Activity = await getX402PaymentActivity(wallet);
+
+    // ── SCORE HISTORY (prior points, before we push this one) ──────────────────
+    const priorHistory = await getScoreHistory(wallet);
+
     // ── WALLET RELATIONSHIP GRAPH (EOA peers only) ─────────────────────────────
     const relationshipGraph = await getRelationshipGraph(wallet, eoaCounterparties);
 
@@ -631,6 +712,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       outcomesTotal,
       erc8257Calls,
       counterpartyAvgScore: relationshipGraph.avgScore,
+      x402Payments:         x402Activity.count,
     });
 
     // Counterparty risk for risk score — based on EOA peers only.
@@ -701,6 +783,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (uniqueContracts > 0)      highlights.push(`${uniqueContracts} unique contracts`);
     if (hasTBA)                   highlights.push("ERC-6551 Token Bound Account confirmed");
     if (erc8257Calls > 0)         highlights.push(`${erc8257Calls} ERC-8257 registry interactions on Base`);
+    if (x402Activity.count > 0)   highlights.push(`${x402Activity.count} stablecoin payments (x402 rail) on ${x402Activity.chains.join(", ")}`);
     if (endorseCount > 0)         highlights.push(`${endorseCount} community endorsements`);
     if (outcomesTotal > 0)        highlights.push(`${outcomesPos}/${outcomesTotal} outcomes positive`);
     if (relationshipGraph.checkedCount > 0) {
@@ -731,6 +814,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       redisIncr(`agentcheck:calls:${source}`),
       // Rating distribution counter (for /api/stats)
       incrRatingCounter(rating),
+      // Score history timeline (for sparkline / trajectory)
+      pushScoreHistory(wallet, adjustedComposite, rating),
     ]);
 
     // ── RESPONSE ───────────────────────────────────────────────────────────────
@@ -782,6 +867,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           note: labelledProtocols.length > 0
             ? "Known protocol/token contracts this address has interacted with. These are excluded from the EOA peer trust graph."
             : "No recognised protocol interactions among recent transactions.",
+        },
+
+        score_history: {
+          points: priorHistory.slice(0, 30).reverse().map((p) => ({
+            composite: p.c, rating: p.r, at: new Date(p.t).toISOString(),
+          })),
+          trajectory: (() => {
+            if (priorHistory.length < 2) return "insufficient_history";
+            const newest = priorHistory[0].c;
+            const oldest = priorHistory[priorHistory.length - 1].c;
+            const delta  = newest - oldest;
+            if (delta > 5)  return "improving";
+            if (delta < -5) return "declining";
+            return "stable";
+          })(),
+          points_recorded: priorHistory.length,
+          note: priorHistory.length < 2
+            ? "Trajectory needs at least two checks over time. This wallet's history is just beginning."
+            : "Composite score trend across recent checks. Direction matters as much as the current value.",
+        },
+
+        x402_payment_activity: {
+          stablecoin_payments_sent: x402Activity.count,
+          chains: x402Activity.chains,
+          note: x402Activity.count > 0
+            ? `${x402Activity.count} outgoing USDC payments detected. x402 micropayments settle on this rail — an agent that pays for services is demonstrably funded and active.`
+            : "No outgoing stablecoin payment activity detected. Agents using x402 to pay for tools/services would show USDC transfers here.",
+          rail: "USDC (x402-compatible)",
         },
 
         erc8257_activity: {
