@@ -294,11 +294,14 @@ async function incrRatingCounter(rating: string): Promise<void> {
 // Push a timestamped composite score onto the wallet's history list (capped).
 async function pushScoreHistory(wallet: string, composite: number, rating: string): Promise<void> {
   try {
+    // Store the entry as a single JSON string. The REST body must be that
+    // JSON string itself (not double-encoded), so it round-trips through one
+    // JSON.parse on read.
     const entry = JSON.stringify({ c: composite, r: rating, t: Date.now() });
     await fetch(`${REDIS_URL}/lpush/${encodeURIComponent("agentcheck:score_history:" + wallet)}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify(entry),
+      body: entry,
     });
     // Trim to last 30 points
     await fetch(`${REDIS_URL}/ltrim/${encodeURIComponent("agentcheck:score_history:" + wallet)}/0/29`, {
@@ -316,7 +319,18 @@ async function getScoreHistory(wallet: string): Promise<Array<{ c: number; r: st
     });
     const data = await res.json() as any;
     const arr  = Array.isArray(data?.result) ? data.result : [];
-    return arr.map((s: string) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+    const out: Array<{ c: number; r: string; t: number }> = [];
+    for (const s of arr) {
+      try {
+        let v: any = JSON.parse(s);
+        if (typeof v === "string") v = JSON.parse(v); // legacy double-encoded
+        const t = typeof v?.t === "number" ? v.t : parseInt(v?.t, 10);
+        if (Number.isFinite(t) && typeof v?.c === "number") {
+          out.push({ c: v.c, r: v.r || "", t });
+        }
+      } catch { /* skip malformed */ }
+    }
+    return out;
   } catch {
     return [];
   }
@@ -870,9 +884,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
 
         score_history: {
-          points: priorHistory.slice(0, 30).reverse().map((p) => ({
-            composite: p.c, rating: p.r, at: new Date(p.t).toISOString(),
-          })),
+          points: priorHistory.slice(0, 30).reverse().map((p) => {
+            const ts = typeof p.t === "number" ? p.t : parseInt(p.t, 10);
+            const iso = Number.isFinite(ts) ? new Date(ts).toISOString() : null;
+            return { composite: p.c, rating: p.r, at: iso };
+          }),
           trajectory: (() => {
             if (priorHistory.length < 2) return "insufficient_history";
             const newest = priorHistory[0].c;
