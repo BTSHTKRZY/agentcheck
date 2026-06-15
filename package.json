@@ -4,6 +4,7 @@
   "dependencies": {
     "@upstash/redis": "latest",
     "@vercel/node": "latest",
-    "viem": "latest"
+    "viem": "latest",
+    "@anthropic-ai/sdk": "latest"
   }
 }
