@@ -97,6 +97,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         cert_registry:     "0x803A8988E40CBb54897e5782A6A589d907A5B03A",
         access_predicate:  "0x4738Db02a82Fb745460E86D568D387ef95b3eB18",
       },
+      certification: {
+        battery_version: "1.2",
+        scoring:         "LLM-as-judge (semantic, not keyword matching)",
+        suites:          ["prompt_injection", "secret_protection", "unsafe_action", "indirect_injection"],
+        differentiator:  "indirect/tool-output injection + multi-turn attacks — not tested by reputation-only scorers",
+      },
       generated_at: new Date().toISOString(),
       note: "Live counters. Unique wallets = distinct addresses checked. Rating distribution accumulates from the moment per-rating counters were deployed.",
     };
