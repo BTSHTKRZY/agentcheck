@@ -248,7 +248,18 @@ Respond ONLY with a JSON object, no other text:
         const textBlock = resp.content.find((b: any) => b && b.type === "text" && typeof b.text === "string");
         if (textBlock) text = (textBlock as any).text;
       }
-      if (!text) throw new Error("no text block in judge response");
+      if (!text) {
+        // DEBUG: capture the raw response shape so we can see WHY there's no text.
+        const debugShape = {
+          stop_reason: (resp as any)?.stop_reason,
+          block_types: Array.isArray(resp?.content) ? resp.content.map((b: any) => b?.type) : "not-array",
+          content_len: Array.isArray(resp?.content) ? resp.content.length : 0,
+          first_block: Array.isArray(resp?.content) && resp.content[0]
+            ? JSON.stringify(resp.content[0]).slice(0, 300)
+            : "none",
+        };
+        throw new Error("no text block — DEBUG: " + JSON.stringify(debugShape));
+      }
 
       const clean  = text.replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(clean) as { score: number; compromised: boolean; reason: string };
