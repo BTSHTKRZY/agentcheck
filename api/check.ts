@@ -115,40 +115,46 @@ function computeTrustScore(data: {
   x402Payments:       number;   // NEW — stablecoin payment activity (x402 rail)
 }): { score: number; breakdown: Record<string, number> } {
 
+  // AGE — widened top end so established wallets pull clearly ahead. (max 20)
   const ageScore =
-    data.ageDays > 1460 ? 15 :
-    data.ageDays > 730  ? 13 :
-    data.ageDays > 365  ? 11 :
+    data.ageDays > 1460 ? 20 :
+    data.ageDays > 1095 ? 18 :
+    data.ageDays > 730  ? 16 :
+    data.ageDays > 365  ? 12 :
     data.ageDays > 180  ? 8  :
     data.ageDays > 90   ? 5  :
     data.ageDays > 30   ? 2  : 0;
 
-  const txScore = Math.min(15, Math.floor(Math.log10(Math.max(1, data.totalTx)) * 4));
+  // VOLUME — log scale, widened so high-volume wallets separate. (max 18)
+  const txScore = Math.min(18, Math.floor(Math.log10(Math.max(1, data.totalTx)) * 5));
 
-  const successScore =
-    data.successRate >= 0.99 ? 20 :
-    data.successRate >= 0.97 ? 18 :
-    data.successRate >= 0.95 ? 15 :
-    data.successRate >= 0.90 ? 10 :
-    data.successRate >= 0.80 ? 5  : 0;
+  // SUCCESS RATE — now GATED BY VOLUME so it stops being a free 20 for
+  // everyone. A high success rate only counts as "proven" with real volume
+  // behind it. Low-volume wallets can't bank the full success bonus. (max 12)
+  const volumeFactor =
+    data.totalTx >= 200 ? 1.0 :
+    data.totalTx >= 50  ? 0.7 :
+    data.totalTx >= 10  ? 0.4 : 0.15;
+  const successBase =
+    data.successRate >= 0.99 ? 12 :
+    data.successRate >= 0.97 ? 10 :
+    data.successRate >= 0.95 ? 8  :
+    data.successRate >= 0.90 ? 5  :
+    data.successRate >= 0.80 ? 2  : 0;
+  const successScore = Math.round(successBase * volumeFactor);
 
-  const defiScore    = Math.min(8, data.defiProtocols * 2);
+  const defiScore    = Math.min(10, data.defiProtocols * 2);  // max 10
   const endorseScore = Math.min(8, data.endorsements * 3);
   const outcomeScore = data.outcomesTotal > 0
     ? Math.round((data.outcomesPositive / data.outcomesTotal) * 5)
     : 0;
 
-  // ERC-8257 tool usage — max 8 pts
   const toolScore = Math.min(8, data.erc8257Calls * 2);
 
-  // Wallet relationship graph — max 8 pts
   const relationshipScore = data.counterpartyAvgScore > 0
     ? Math.round((data.counterpartyAvgScore / 100) * 8)
     : 0;
 
-  // x402 / stablecoin payment activity — max 10 pts
-  // An agent that pays for services on the x402 rail is demonstrably
-  // funded, active, and economically real. Harder to fake than tx count.
   const x402Score =
     data.x402Payments >= 50 ? 10 :
     data.x402Payments >= 20 ? 8  :
@@ -260,7 +266,28 @@ function computeAgentScore(data: {
 // ── COMPOSITE ─────────────────────────────────────────────────────────────────
 
 function compositeScore(trust: number, risk: number, agent: number): number {
-  return Math.round(trust * 0.5 + (100 - risk) * 0.3 + agent * 0.2);
+  // Moody's-style scorecard: the trust aggregate IS the base score (mapped
+  // across the full range), risk acts as a MULTIPLIER (dampener) rather than a
+  // flat additive cushion, and agent identity is a bonus on top.
+  //
+  // riskMultiplier: clean (risk<=20) keeps ~full credit; higher risk scales the
+  // score down sharply. This replaces the old flat (100-risk)*0.3 = +24 cushion
+  // that compressed every clean wallet into the same band.
+  const riskMultiplier =
+    risk <= 20 ? 1.00 :
+    risk <= 35 ? 0.85 :
+    risk <= 50 ? 0.65 :
+    risk <= 70 ? 0.40 :
+    risk <= 85 ? 0.20 : 0.05;
+
+  // Agent identity adds real lift (registered agents are more accountable).
+  const agentBonus = Math.round(agent * 0.15);
+
+  // Trust drives the range. A strong wallet (trust 80) clean (mult 1.0) lands
+  // ~80+bonus = A/AA; a thin-but-clean wallet (trust 45) lands ~45 = B/BB;
+  // a flagged wallet gets multiplied down toward C/D.
+  const base = trust * riskMultiplier + agentBonus;
+  return Math.round(Math.max(0, Math.min(100, base)));
 }
 
 // ── ERC-8257 TOOL USAGE (Base network) ───────────────────────────────────────
@@ -764,22 +791,54 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
     const rawComposite = compositeScore(trustScore, riskScore, agentScore);
-    const hasRealHistory = trueAgeDays >= 30 && trueTotalTx >= 5;
     const hasSeriousFlag = gbSanctioned || gbMixer || gbDarkweb || gbPhishing || gbRugPull || isCommunityFlagged;
-    const adjustedComposite = (hasRealHistory && !hasSeriousFlag)
-      ? Math.max(rawComposite, 50)
-      : rawComposite;
+    // A wallet has "real activity" if it shows EITHER meaningful age OR
+    // meaningful volume — a clean 5-day wallet with 30 successful txs is
+    // legitimately establishing, not high-risk. Known/verified contracts
+    // (USDC, routers, etc) also qualify.
+    const hasRealActivity =
+      trueAgeDays >= 30 ||
+      trueTotalTx >= 20 ||
+      (knownLabel && knownLabel.verified) ||
+      addressIsContract;
+    // SOFT floor (balanced scale): clean + real activity → not below B (40).
+    // Recognised/verified addresses get a slightly higher floor (BB/50) since
+    // a known major contract shouldn't read as "weak". Flagged wallets get no
+    // floor and can fall to C/D. Genuine strength still rises to A/AA/AAA.
+    let adjustedComposite = rawComposite;
+    if (!hasSeriousFlag && hasRealActivity) {
+      const floor = (knownLabel && knownLabel.verified) ? 50 : 40;
+      adjustedComposite = Math.max(rawComposite, floor);
+    }
+    adjustedComposite = Math.round(adjustedComposite);
 
-    const rating       = compositeToLetter(adjustedComposite);
+    // ── NOT RATED: insufficient history ────────────────────────────────────────
+    // A genuinely unproven address — too new AND too few transactions, with no
+    // identifying signal — is "Not Rated", NOT low-rated. "Unknown" and
+    // "malicious" must not share a letter. This mirrors how rating agencies
+    // treat issuers with insufficient information. Flagged/sanctioned wallets
+    // are NEVER NR — a real adverse signal always produces a rating.
+    const insufficientHistory =
+      trueAgeDays < 7 &&
+      trueTotalTx < 5 &&
+      !addressIsContract &&
+      !knownLabel &&
+      !isErc8004 &&
+      !hasAgentBinding;
+    const isNotRated = insufficientHistory && !hasSeriousFlag;
+
+    const rating       = isNotRated ? "NR" : compositeToLetter(adjustedComposite);
     // Contract-aware verdict: a labelled/verified contract is infrastructure,
     // not a personal wallet to "trust with funds" in the same sense.
-    let verdict = letterToVerdict(rating, isErc8004 || hasAgentBinding);
-    if (knownLabel) {
+    let verdict = isNotRated
+      ? "Not Rated — insufficient on-chain history to assess. This wallet is new with very little activity. That is not a negative signal; there simply isn't enough data yet. Treat as unproven: verify identity through other means before transacting."
+      : letterToVerdict(rating, isErc8004 || hasAgentBinding);
+    if (!isNotRated && knownLabel) {
       verdict = `Known ${knownLabel.type}: ${knownLabel.label}. ` +
         (knownLabel.verified
           ? "Recognised, verified address. Treat as infrastructure, not a peer wallet."
           : "Recognised address. Verify intent before transacting.");
-    } else if (addressIsContract) {
+    } else if (!isNotRated && addressIsContract) {
       verdict = `This address is a smart contract, not an EOA wallet. ` +
         `Wallet-history trust signals apply differently — evaluate the contract's ` +
         `verification, usage, and audit status rather than 'who it transacts with'.`;
@@ -827,9 +886,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // Track source
       redisIncr(`agentcheck:calls:${source}`),
       // Rating distribution counter (for /api/stats)
-      incrRatingCounter(rating),
-      // Score history timeline (for sparkline / trajectory)
-      pushScoreHistory(wallet, adjustedComposite, rating),
+      // NR is not a band on the AAA–D scale — count it separately, not in the
+      // rating distribution. Real ratings increment their band as before.
+      isNotRated ? redisIncr("agentcheck:rating:NR") : incrRatingCounter(rating),
+      // Score history timeline — only for rated wallets (NR has no score yet).
+      ...(isNotRated ? [] : [pushScoreHistory(wallet, adjustedComposite, rating)]),
     ]);
 
     // ── RESPONSE ───────────────────────────────────────────────────────────────
