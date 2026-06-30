@@ -17,7 +17,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 // analytics — the premium depth on top of the free snapshot.
 
 const PAYOUT_ADDRESS = "0x020d6409Ebc4fa13E754e0fEa275ac353eFD4f03";
-const PRICE_USDC     = "0.20";
+const PRICE_USDC     = "0.02";
 
 const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL!;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
